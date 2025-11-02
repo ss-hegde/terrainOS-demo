@@ -16,3 +16,9 @@ notebooks/data_fetch_pipeline.ipynb
 
 # Ignore notebook checkpoints
 .ipynb_checkpoints/
+
+
+# 
+notebooks/04_application_workflow_multisensor.ipynb
+
+orchestrator/workflow_manager_multisensor_v0.py

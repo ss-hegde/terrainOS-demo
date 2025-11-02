@@ -1,5 +1,5 @@
 from __future__ import annotations
-from datetime import date
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple, Sequence
 from shapely.geometry import Point, mapping, shape, box
 from pystac_client import Client
@@ -60,3 +60,117 @@ def search_s2_items(
 
     if limit: items = items[:limit]
     return items
+
+def search_s1_items(
+        aoi_geojson_or_geom,
+        start_date: str | date,
+        end_date: str | date,
+        orbit: Optional[str] = None,
+        limit: Optional[int] = None,
+        widen_days: int = 14,
+    ):
+    """
+    Search Sentinel-1 **RTC** items over AOI/time. Returns items sorted by datetime.
+
+    Notes:
+      - Queries the `sentinel-1-rtc` collection (geocoded COGs with valid CRS/transform).
+      - Keeps the IW instrument mode filter.
+      - Optional orbit filter: 'ascending' or 'descending'.
+      - Expands the time window by `widen_days` if initial search yields no items.
+    """
+    catalog = Client.open(stac_api_url, modifier=planetary_computer.sign_inplace)
+
+    # Accept either a GeoJSON Feature/Geometry or a bare geometry dict
+    if isinstance(aoi_geojson_or_geom, dict):
+        geom = aoi_geojson_or_geom.get("geometry", aoi_geojson_or_geom)
+    else:
+        geom = aoi_geojson_or_geom
+
+    def _query(range_start, range_end):
+        q = {"sar:instrument_mode": {"eq": "IW"}}
+        if orbit:
+            q["sat:orbit_state"] = {"eq": orbit}  # 'ascending' or 'descending'
+        return list(
+            catalog.search(
+                collections=["sentinel-1-rtc"],
+                intersects=geom,
+                datetime=f"{range_start}/{range_end}",
+                query=q,
+            ).items()
+        )
+
+    # 1) Try the requested range
+    items = _query(start_date, end_date)
+
+    # 2) Widen the window if needed
+    if not items and widen_days > 0:
+        start_dt = datetime.fromisoformat(str(start_date))
+        end_dt   = datetime.fromisoformat(str(end_date))
+        wstart   = (start_dt - timedelta(days=widen_days)).date().isoformat()
+        wend     = (end_dt   + timedelta(days=widen_days)).date().isoformat()
+        items    = _query(wstart, wend)
+
+    # Nothing found
+    if not items:
+        return []
+
+    # Sort + limit
+    items.sort(key=lambda i: i.properties.get("datetime"))
+    if limit:
+        items = items[:limit]
+    return items
+
+# def search_s1_items(
+#         aoi_geojson_or_geom,
+#         start_date: str | date,
+#         end_date: str | date,
+#         orbit: Optional[str] = None,
+#         limit: Optional[int] = None,
+#         widen_days: int = 14,
+#     ):
+
+#     """
+#     Search Sentinel-1 GRD IW items over AOI/time. Returns items sorted by datetime.
+#     """
+#     catalog = Client.open(stac_api_url, modifier=planetary_computer.sign_inplace)
+#     geom = (aoi_geojson_or_geom.get("geometry") if isinstance(aoi_geojson_or_geom, dict)
+#             and "type" in aoi_geojson_or_geom and aoi_geojson_or_geom["type"] != "Polygon"
+#             else aoi_geojson_or_geom)
+    
+#     def _query(range_start, range_end, collections, with_grd_filter=True):
+#         q = {"sar:instrument_mode": {"eq": "IW"}}
+#         if with_grd_filter:
+#             q["sar:product_type"] = {"eq": "GRD"}
+#         if orbit:
+#             q["sat:orbit_state"] = {"eq": orbit}
+#         return list(catalog.search(
+#             collections=collections,
+#             intersects=geom,
+#             datetime=f"{range_start}/{range_end}",
+#             query=q
+#         ).items())
+    
+#     # try GRD + filters
+#     items = _query(start_date, end_date, ["sentinel-1-grd"], with_grd_filter=True)
+#     # relax product filter
+#     if not items:
+#         items = _query(start_date, end_date, ["sentinel-1-grd"], with_grd_filter=False)
+#     # widen the window
+#     if not items and widen_days > 0:
+#         start_dt = datetime.fromisoformat(start_date)
+#         end_dt   = datetime.fromisoformat(end_date)
+#         wstart   = (start_dt - timedelta(days=widen_days)).date().isoformat()
+#         wend     = (end_dt   + timedelta(days=widen_days)).date().isoformat()
+#         items    = _query(wstart, wend, ["sentinel-1-grd"], with_grd_filter=False)
+#     # try RTC as a last resort (coverage is limited regionally)
+#     if not items:
+#         items = _query(start_date, end_date, ["sentinel-1-rtc"], with_grd_filter=False)
+
+#     if not items:
+#         return []
+
+#     items.sort(key=lambda i: i.properties.get("datetime"))
+#     if limit:
+#         items = items[:limit]
+#     return items
+    

@@ -36,8 +36,9 @@ def discover_s2_collection(region_dir: Path) -> Path:
     for scene_dir in sorted(region_dir.iterdir()):
         if not scene_dir.is_dir():
             continue
-        tiles_dir = scene_dir / "tiles_s2"
+        tiles_dir = "S2" / scene_dir / "tiles_s2"
         mani = tiles_dir / "manifest.json"
+        # print("mani S2:", mani)
         if mani.exists():
             # print(f"Found scene manifest: {mani}")
             scene_id = scene_dir.name
@@ -69,5 +70,52 @@ def discover_s2_collection(region_dir: Path) -> Path:
     entries.sort(key=lambda e: e["datetime"])
 
     coll_path = region_dir / "collection_manifest.json"
+    coll_path.write_text(json.dumps({"scenes": entries}, indent=2))
+    return coll_path
+
+def discover_s1_collection(region_dir: Path) -> Path:
+    """
+    Scan an existing region directory for scene manifests and build/overwrite
+    collection_manifest.json *without* re-tiling or re-fetching.
+    Expected layout:
+        region_dir/
+          <scene_id>/
+            tiles_s1/
+              manifest.json
+    """
+
+    region_dir = Path(region_dir)
+    entries = []
+    for scene_dir in sorted(region_dir.iterdir()):
+        if not scene_dir.is_dir():
+            continue
+        tiles_dir = "S1" / scene_dir / "tiles_s1"
+        mani = tiles_dir / "manifest.json"
+        # print("mani S1:", mani)
+        if mani.exists():
+            # print(f"Found scene manifest: {mani}")
+            scene_id = scene_dir.name
+            # try to read mgrs from a hint file if you saved one earlier; otherwise None
+            scene_meta = scene_dir / "scene_meta.json"
+            dt = None
+            if scene_meta.exists():
+                try:
+                    meta = json.loads(scene_meta.read_text())
+                    dt = meta.get("datetime")
+                except Exception:
+                    pass
+            if dt is None:
+                dt = _guess_datetime(scene_id)
+            entries.append({
+                "scene_id": scene_id,
+                "datetime": dt,
+                "manifest_path": str(mani),
+            })
+    if not entries:
+        raise RuntimeError(f"No scene manifests found under {region_dir}. "
+                           f"Expected subfolders like <scene_id>/tiles_s1/manifest.json")
+    # sort by datetime string
+    entries.sort(key=lambda e: e["datetime"])
+    coll_path = region_dir / "collection_manifest_s1.json"
     coll_path.write_text(json.dumps({"scenes": entries}, indent=2))
     return coll_path

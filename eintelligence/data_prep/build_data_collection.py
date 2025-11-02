@@ -39,8 +39,55 @@ def build_s2_data_collection(
             "manifest_path": str(manifest_path)
         })
     
-    collection_path = out_dir / "collection_manifest.json"
+    collection_path = out_dir / "collection_manifest_s2.json"
     with open(collection_path, "w") as f:
         json.dump({"scenes": entries}, f, indent=2)
 
     return collection_path
+
+def build_s1_data_collection(
+    items: Sequence,
+    out_dir: Path, 
+    bands=("vv","vh"),
+    tile_size: int = 512,
+    stride: int = 256,
+    aoi_geojson = None) -> Path:
+    """
+    For each STAC item: tile -> tiles_dir + scene manifest.
+    Create a collection_manifest.json listing all scenes (scene_id, date, mgrs, manifest_path).
+    """
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    entries = []
+    for item in items:
+        scene_id = item.id.replace(":", "_")
+        scene_dir = out_dir / scene_id
+        tiles_dir = scene_dir / "tiles_s1"
+        tiles_dir.mkdir(parents=True, exist_ok=True)
+
+        signed_item = planetary_computer.sign(item)
+        manifest_path = tile_stac_item_to_cogs(
+            signed_item, 
+            sensor="S1",
+            bands=bands,
+            out_dir=tiles_dir,
+            tile_size=tile_size,
+            stride=stride,
+            min_valid_fraction=0.3,
+            web_optimized=False,
+            aoi_geojson=aoi_geojson,
+        )
+
+        entries.append({
+            "scene_id": scene_id,
+            "datetime": item.properties.get("datetime"),
+            "manifest_path": str(manifest_path)
+        })
+
+    collection_path = out_dir / "collection_manifest_s1.json"
+    
+    with open(collection_path, "w") as f:
+        json.dump({"scenes": entries}, f, indent=2)
+    
+    return collection_path
+            
