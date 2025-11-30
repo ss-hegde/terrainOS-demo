@@ -22,7 +22,8 @@ from eintelligence.data_prep.build_data_collection import (
 )
 from eintelligence.data_prep.temporal_pairing import (
     build_temporal_pairs,                   # single-sensor (S2 or S1)
-    build_temporal_pairs_multisensor        # S1+S2
+    build_temporal_pairs_multisensor,      # S1+S2
+    build_temporal_pairs_relaxed_s1        # relaxed S1 pairing
 )
 from eintelligence.data_prep.resume import (
     discover_s1_collection, discover_s2_collection
@@ -514,3 +515,236 @@ class DeforestationWorkflowMS:
         else:
             print(f"Using existing adapter checkpoint: {ckpt_path}")
         self.infer_latest(pairs_manifest, ckpt_path, out_dir, **infer_kwargs)
+
+
+# ================================================================================
+#--------------------- FLOOD WORKFLOW --------------------------------------------
+# ================================================================================
+
+# local helper: SAR quicklook (VV in dB)
+def _sar_quicklook_vv_db(tile_path: Path, out_png: Path):
+    with rasterio.open(tile_path) as src:
+        vv = src.read(1).astype(np.float32)
+    vv_db = 10.0 * np.log10(np.clip(vv, 1e-6, None))
+    # simple stretch to [0,1]
+    img = np.clip((vv_db + 20.0)/20.0, 0.0, 1.0)
+    plt.figure(figsize=(4,4), dpi=150)
+    plt.imshow(img, cmap="gray")
+    plt.axis("off")
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    plt.tight_layout(pad=0)
+    plt.savefig(out_png, bbox_inches="tight", pad_inches=0)
+    plt.close()
+
+@dataclass
+class TilingConfigS1:
+    bands_s1: tuple[str, ...] = ("vv","vh")
+    tile_size: int = 256
+    stride: Optional[int] = 256
+
+class _TrainerFloodS1:
+    """Small trainer for S1-only flood adapter (keeps backbone frozen)."""
+    def __init__(self, device: torch.device, cfg: TrainingConfig):
+        self.device = device
+        self.cfg = cfg
+        self.scaler = GradScaler(enabled=(device.type=="cuda" and cfg.amp))
+        torch.backends.cudnn.benchmark = True
+
+    @staticmethod
+    def _loss(logits, target, eps=1e-6):
+        # upsample logits if needed to match target size
+        if logits.shape[-2:] != target.shape[-2:]:
+            logits = F.interpolate(logits, size=target.shape[-2:], mode="bilinear", align_corners=False)
+        bce  = F.binary_cross_entropy_with_logits(logits, target)
+        prob = torch.sigmoid(logits)
+        inter= (prob*target).sum(dim=(2,3))
+        dice = 1 - (2*inter + eps)/(prob.sum(dim=(2,3))+target.sum(dim=(2,3))+eps)
+        return bce + dice.mean()
+
+    def fit(self, dataset, backbone, adapter, ckpt_path: Path):
+        if len(dataset) == 0:
+            raise RuntimeError("Flood dataset is empty (0 pairs). Check S1 pairing or time window.")
+
+        n_val = max(1, int(len(dataset)*self.cfg.val_fraction))
+        n_train = max(1, len(dataset) - n_val)
+        train_set, val_set = random_split(dataset, [n_train, n_val])
+
+        tl = DataLoader(train_set, batch_size=self.cfg.batch_size, shuffle=True,
+                        num_workers=self.cfg.num_workers, pin_memory=True,
+                        persistent_workers=self.cfg.num_workers>0)
+        vl = DataLoader(val_set, batch_size=self.cfg.batch_size, shuffle=False,
+                        num_workers=self.cfg.num_workers, pin_memory=True,
+                        persistent_workers=self.cfg.num_workers>0)
+
+        opt = torch.optim.AdamW(filter(lambda p: p.requires_grad, adapter.parameters()),
+                                lr=self.cfg.lr, weight_decay=self.cfg.weight_decay)
+
+        best = float("inf")
+        ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+
+        backbone.eval()  # keep frozen
+        for e in range(self.cfg.num_epochs):
+            # train
+            adapter.train()
+            tot = 0.0
+            for xb, yb, _ in tl:
+                x0 = xb["t0"].to(self.device); x1 = xb["t1"].to(self.device); yb = yb.to(self.device)
+                with autocast(enabled=(self.device.type=="cuda" and self.cfg.amp)):
+                    out = adapter(x0, x1, backbone)
+                    loss = self._loss(out["logits"], yb)
+                opt.zero_grad(set_to_none=True)
+                self.scaler.scale(loss).backward()
+                self.scaler.step(opt)
+                self.scaler.update()
+                tot += float(loss.item()) * yb.size(0)
+            tr = tot / len(train_set)
+
+            # val
+            adapter.eval()
+            tot = 0.0
+            with torch.no_grad():
+                for xb, yb, _ in vl:
+                    x0 = xb["t0"].to(self.device); x1 = xb["t1"].to(self.device); yb = yb.to(self.device)
+                    out = adapter(x0, x1, backbone)
+                    loss = self._loss(out["logits"], yb)
+                    tot += float(loss.item()) * yb.size(0)
+            vloss = tot / len(val_set)
+
+            print(f"[epoch {e:02d}] train={tr:.4f}  val={vloss:.4f}")
+            if vloss < best:
+                best = vloss
+                torch.save({"adapter": adapter.state_dict()}, ckpt_path)
+                print(f"  ↳ saved {ckpt_path}")
+
+class FloodWorkflowS1:
+    """
+    S1-only flood workflow:
+      - build/resume S1 tiles
+      - temporal pair (S1-only)
+      - train (weak labels by default)
+      - infer (COG mask, quicklook) + analytics (area/patches/polygons)
+    """
+    def __init__(self, project_root: Path | str,
+                 tiling_cfg: TilingConfigS1 = TilingConfigS1(),
+                 train_cfg: TrainingConfig = TrainingConfig(),
+                 skip_to_pairing: bool = False):
+        self.root = Path(project_root)
+        self.tcfg = tiling_cfg
+        self.skip_to_pairing = skip_to_pairing
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.trainer = _TrainerFloodS1(self.device, train_cfg)
+
+        # lazy imports to avoid modifying existing import section
+        from eintelligence.backbone.ssl4eo_lite_backbone import SSL4EOLiteConfig, SSL4EOLiteBackbone
+        from eintelligence.adapters.flood_change import FloodChangeAdapter
+
+        bb_cfg = SSL4EOLiteConfig(in_ch=len(self.tcfg.bands_s1), freeze=True, state_dict=None)
+        self.backbone = SSL4EOLiteBackbone(bb_cfg).to(self.device)
+        self.adapter  = FloodChangeAdapter(c_backbone=self.backbone.out_channels, c_align=256).to(self.device)
+
+    def build_data(self, aoi_geojson: Dict[str, Any], start: str, end: str, region_name: str) -> Path:
+        region_dir = self.root / "data" / region_name
+        region_dir.mkdir(parents=True, exist_ok=True)
+
+        if self.skip_to_pairing:
+            coll = discover_s1_collection(region_dir / "S1")
+        else:
+            s1_items = search_s1_items(aoi_geojson, start, end)
+            if not s1_items:
+                raise RuntimeError("No Sentinel-1 items found for given AOI/time.")
+            coll = build_s1_data_collection(
+                s1_items, out_dir=region_dir / "S1",
+                bands=self.tcfg.bands_s1, 
+                tile_size=self.tcfg.tile_size, stride=self.tcfg.stride,
+                aoi_geojson=aoi_geojson
+            )
+        # pairs_manifest = build_temporal_pairs(coll)  # S1-only consecutive pairing
+        # print("Collection manifest:", coll)
+        pairs_manifest = build_temporal_pairs_relaxed_s1(coll, iou_thresh=0.90)
+        print(f"S1 pairs manifest: {pairs_manifest}")
+        return pairs_manifest
+
+    def train(self, pairs_manifest: Path, ckpt_path: Path, use_weak_labels: bool = True):
+        # lazy import to avoid edits above
+        from eintelligence.data_prep.flood_s1_dataset import FloodS1ChangeDataset
+        ds = FloodS1ChangeDataset(Path(pairs_manifest),
+                                   tile_size=self.tcfg.tile_size,
+                                   use_weak_labels=use_weak_labels)
+        self.trainer.fit(ds, self.backbone, self.adapter, ckpt_path)
+
+    @torch.inference_mode()
+    def infer_latest(self, pairs_manifest: Path, ckpt_path: Path, out_dir: Path,
+                     max_tiles: int = 32, prob_thresh: float = 0.5,
+                     slope_deg: Optional[np.ndarray] = None, max_slope_deg: float = 5.0) -> Path:
+        # lazy imports
+        from eintelligence.analytics.flood import flood_summary
+
+        if ckpt_path.exists():
+            state = torch.load(ckpt_path, map_location=self.device)
+            self.adapter.load_state_dict(state["adapter"])
+        self.adapter.eval(); self.backbone.eval()
+
+        pairs = json.loads(Path(pairs_manifest).read_text())["pairs"]
+        if not pairs:
+            raise RuntimeError("No S1 pairs in manifest.")
+        last_key = pairs[-1]["s2_id"] if "s2_id" in pairs[-1] else None
+        last_pairs = [p for p in pairs if p.get("s2_id", last_key) == last_key] if last_key else pairs
+
+        out_dir.mkdir(parents=True, exist_ok=True)
+        saved = 0
+        for p in last_pairs:
+            with rasterio.open(p["t1_path"]) as a, rasterio.open(p["t2_path"]) as b:
+                A = a.read().astype(np.float32)   # [2,H,W] linear VV,VH
+                B = b.read().astype(np.float32)
+                aff = b.transform
+
+            # preprocess to normalized dB (same as dataset)
+            def _norm_db(Z):
+                Zdb = 10.0*np.log10(np.clip(Z, 1e-6, None))
+                m = np.array([-12.0, -18.0], np.float32)[:,None,None]
+                s = np.array([  6.0,   6.0], np.float32)[:,None,None]
+                return (Zdb - m) / (s + 1e-6)
+
+            A_n = _norm_db(A); B_n = _norm_db(B)
+            x0 = torch.from_numpy(A_n)[None].to(self.device)
+            x1 = torch.from_numpy(B_n)[None].to(self.device)
+
+            with autocast(enabled=(self.device.type=="cuda")):
+                out = self.adapter(x0, x1, self.backbone)
+                logits = out["logits"]
+                # upsample logits to full tile HxW if decoder output is smaller
+                H, W = B.shape[1], B.shape[2]
+                if logits.shape[-2:] != (H, W):
+                    logits = F.interpolate(logits, size=(H, W), mode="bilinear", align_corners=False)
+                prob = torch.sigmoid(logits).float().cpu().numpy()[0,0]
+
+            # analytics
+            summary = flood_summary(prob, transform=aff, thr=prob_thresh,
+                                    slope_deg=slope_deg, max_slope_deg=max_slope_deg)
+            mask = (prob >= prob_thresh).astype(np.uint8) * 255
+
+            src_t2 = Path(p["t2_path"])
+            out_mask = out_dir / (src_t2.stem + "_flood_s1.tif")
+            _save_mask_like(src_t2, mask, out_mask)
+
+            # quicklook (VV dB)
+            ql_dir = out_dir / "quicklooks"
+            _sar_quicklook_vv_db(src_t2, ql_dir / (src_t2.stem + "_vv.png"))
+
+            with open(out_mask.with_suffix(".json"), "w") as f:
+                json.dump(summary, f, indent=2)
+
+            saved += 1
+            if saved >= max_tiles:
+                break
+
+        print(f"wrote {saved} flood tiles -> {out_dir}")
+        return out_dir
+
+    def run(self, pairs_manifest: Path, ckpt_path: Path, out_dir: Path,
+            retrain: bool = False, use_weak_labels: bool = True, **infer_kwargs):
+        if retrain or not ckpt_path.exists():
+            self.train(pairs_manifest, ckpt_path, use_weak_labels=use_weak_labels)
+        else:
+            print(f"Using existing flood adapter checkpoint: {ckpt_path}")
+        return self.infer_latest(pairs_manifest, ckpt_path, out_dir, **infer_kwargs)

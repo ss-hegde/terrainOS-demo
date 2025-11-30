@@ -4,6 +4,7 @@ from typing import List, Dict, Tuple, Optional
 from datetime import datetime
 from shapely.geometry import shape, box
 from shapely.strtree import STRtree
+from shapely.ops import unary_union
 
 def _tile_key(props: dict) -> tuple:
     """
@@ -77,6 +78,84 @@ def build_temporal_pairs(
     
     out_path = Path(collection_manifest_path).parent / "pairs_manifest.json"
     out_path.write_text(json.dumps({"pairs": pairs}, indent=2))
+    return out_path
+
+def _read_scene_tiles(manifest_path: Path):
+    """
+    Returns a list of dicts:
+      [{"geom": shapely_polygon, "path": abs_path, "props": props_dict}, ...]
+    """
+    base = Path(manifest_path).parent
+    m = json.loads(Path(manifest_path).read_text())
+    tiles = []
+    for ft in m["features"]:
+        geom = shape(ft["geometry"])
+        props = ft["properties"]
+        tiles.append({
+            "geom": geom,
+            "path": str(base / props["path"]),
+            "props": props
+        })
+    return tiles
+
+def build_temporal_pairs_relaxed_s1(
+    collection_manifest_path: Path,
+    iou_thresh: float = 0.90
+) -> Path:
+    """
+    Pair consecutive S1 scenes by matching tiles whose geographic bounds overlap
+    with IoU >= iou_thresh. Outputs pairs_manifest.json with entries:
+      { "row": <int|None>, "col": <int|None>,
+        "t1_path": <str>, "t2_path": <str>,
+        "s1_id": <scene_id_prev>, "s2_id": <scene_id_next> }
+
+    Notes:
+    - Falls back to row/col=None when we don't have stable grid indices.
+    - Much more tolerant to tiny grid misalignments between scenes.
+    """
+    coll = json.loads(Path(collection_manifest_path).read_text())["scenes"]
+    coll = sorted(coll, key=lambda e: e["datetime"])
+    out = []
+
+    for i in range(len(coll) - 1):
+        A, B = coll[i], coll[i+1]
+        tiles_A = _read_scene_tiles(Path(A["manifest_path"]))
+        tiles_B = _read_scene_tiles(Path(B["manifest_path"]))
+
+        # index B tiles by simple bbox hash buckets for speed (optional, simple O(N^2) is fine for small sets)
+        for ta in tiles_A:
+            ga = ta["geom"]
+            best_iou = 0.0
+            best_tb = None
+
+            # brute-force match (usually a few hundred tiles max)
+            for tb in tiles_B:
+                gb = tb["geom"]
+                inter = ga.intersection(gb).area
+                if inter <= 0.0:
+                    continue
+                union = ga.union(gb).area
+                iou = inter / union if union > 0 else 0.0
+                if iou > best_iou:
+                    best_iou, best_tb = iou, tb
+
+            if best_tb is not None and best_iou >= iou_thresh:
+                # try to keep row/col if present (won't be identical across scenes necessarily)
+                r = ta["props"].get("row")
+                c = ta["props"].get("col")
+
+                out.append({
+                    "row": int(r) if r is not None else None,
+                    "col": int(c) if c is not None else None,
+                    "t1_path": ta["path"],
+                    "t2_path": best_tb["path"],
+                    "s1_id": A["scene_id"],
+                    "s2_id": B["scene_id"],
+                    "iou": float(best_iou)
+                })
+
+    out_path = Path(collection_manifest_path).parent / "pairs_manifest.json"
+    out_path.write_text(json.dumps({"pairs": out}, indent=2))
     return out_path
     
 # def build_temporal_pairs_multisensor(
