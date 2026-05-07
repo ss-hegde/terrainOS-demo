@@ -25,13 +25,13 @@ class FusionOutput:
 
     fused: shared fused embeddings used by the downstream adapter heads
     per_modality: optional modality-specific feature maps
-    uncertainity: optional per-pixel or per-tile uncertainity estimates
-    aux: extra atifacts, e.g. attention maps, XAI Output, etc.
+    uncertainty: optional per-pixel or per-tile uncertainty estimates
+    aux: extra artifacts, e.g. attention maps, XAI Output, etc.
     """
 
     fused: torch.Tensor
     per_modality: Dict[str, torch.Tensor]
-    uncertainity: Optional[torch.Tensor]
+    uncertainty: Optional[torch.Tensor]
     aux: Dict[str, Any]
 
 class BaseFusionKernel(nn.Module):
@@ -47,7 +47,7 @@ class BaseFusionKernel(nn.Module):
             batch: FusionBatch containing imagery, masks, and metadata.
 
         Returns:
-            FusionOutput containing fused embeddings, per-modality features, uncertainity estimates, and auxiliary artifacts.
+            FusionOutput containing fused embeddings, per-modality features, uncertainty estimates, and auxiliary artifacts.
         """
         raise NotImplementedError("Fusion kernels must implement the forward method.")
     
@@ -74,6 +74,37 @@ class IdentityFusionKernel(BaseFusionKernel):
         return FusionOutput(
             fused=fused,
             per_modality=per_modality,
-            uncertainity=None,
+            uncertainty=None,
             aux={}
+        )
+
+class MultisensorIdentityFusionKernel(BaseFusionKernel):
+    """
+    Wraps MultiSensorSSL4EOLiteBackbone and exposes its per-modality features
+    via FusionOutput.per_modality. For now, .fused can be a simple choice
+    (e.g., concatenation or one branch) and is not used by this adapter yet.
+
+    Expects a backbone(s1, s2) -> Dict[str, Tensor] (e.g. MultiSensorSSL4EOLiteBackbone).
+    """
+
+    def __init__(self, backbone: nn.Module):
+        super().__init__()
+        self.backbone = backbone
+
+    def forward(self, batch: FusionBatch) -> FusionOutput:
+        s1 = batch.imagery.get("s1", None)
+        s2 = batch.imagery.get("s2", None)
+
+        feats = self.backbone(s1, s2)   # {"s1": ..., "s2": ...}
+
+        if "s2" in feats:
+            fused = feats["s2"]
+        else:
+            fused = next(iter(feats.values()))
+
+        return FusionOutput(
+            fused=fused,
+            per_modality=feats,
+            uncertainty=None,
+            aux={},
         )

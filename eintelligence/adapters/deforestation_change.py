@@ -4,6 +4,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Dict
 
+# Kernel building blocks
+from eintelligence.fusion.kernel_base import BaseFusionKernel, FusionBatch, FusionOutput
+
 #----------- building blocks -----------
 
 class ConvAlign(nn.Module):
@@ -107,18 +110,58 @@ class DeforestationChangeAdapter(nn.Module):
         else:
             raise ValueError("No sensor features provided for fusion.")
         
-    def forward(self, batch: Dict, backbone: nn.Module) -> Dict[str, torch.Tensor]:
+    def _make_fusion_batch(self, time_dict: Dict[str, torch.Tensor]) -> FusionBatch:
         """
-        backbone: MultiSensorSSL4EOLiteBackbone
+        Wraps the per-time sensor features into a FusionBatch for potential use in more complex fusion kernels.
+        
+        time_dict: {"s1": Tensor?, "s2": Tensor?}
         """
-        # encode each time with the same backbones (weights frozen by backbone class)
-        feats_t0 = backbone(batch["t0"].get("s1"), batch["t0"].get("s2"))
-        feats_t1 = backbone(batch["t1"].get("s1"), batch["t1"].get("s2"))
+        imagery = {}
+        masks = {}
 
-        # fuse sensors per time
+        for modality in ("s1", "s2"):
+            if modality in time_dict and time_dict[modality] is not None:
+                x = time_dict[modality]
+                imagery[modality] = x
+                masks[modality] = torch.ones(x.shape[0], 1, x.shape[2], x.shape[3], 
+                                             dtype=torch.bool, 
+                                                device=x.device)  # assume full valid mask for present modalities
+                
+        return FusionBatch(imagery=imagery, masks=masks, meta={})
+    
+
+    def forward(self, batch: Dict, fusion_kernel: BaseFusionKernel) -> Dict[str, torch.Tensor]:
+        """
+        fusion_kernel: BaseFusionKernel
+        batch:
+          "t0": {"s1": Tensor or None, "s2": Tensor or None}
+          "t1": {"s1": Tensor or None, "s2": Tensor or None}
+        """
+        # # encode each time with the same backbones (weights frozen by backbone class)
+        # feats_t0 = backbone(batch["t0"].get("s1"), batch["t0"].get("s2"))
+        # feats_t1 = backbone(batch["t1"].get("s1"), batch["t1"].get("s2"))
+
+        # # fuse sensors per time
+        # ft0 = self._fuse_sensors(feats_t0)  # (B, C_align, H/32, W/32)
+        # ft1 = self._fuse_sensors(feats_t1)
+
+        # # decode
+        # logits = self.decoder(ft0, ft1) # (B,1,H,W) 
+        # return {"logits": logits}
+        
+        # Build FusionBatch objects for t0 and t1
+        fb_t0 = self._make_fusion_batch(batch["t0"])
+        fb_t1 = self._make_fusion_batch(batch["t1"])
+
+        # call fusion kernel for each time step to get fused features
+        fusion_t0: FusionOutput = fusion_kernel(fb_t0)
+        fusion_t1: FusionOutput = fusion_kernel(fb_t1)
+
+        feats_t0 = fusion_t0.per_modality # e.g. {"s1": Tensor, "s2": Tensor} 
+        feats_t1 = fusion_t1.per_modality
+
         ft0 = self._fuse_sensors(feats_t0)  # (B, C_align, H/32, W/32)
         ft1 = self._fuse_sensors(feats_t1)
 
-        # decode
-        logits = self.decoder(ft0, ft1) # (B,1,H,W) 
+        logits = self.decoder(ft0, ft1) # (B,1,H,W)
         return {"logits": logits}

@@ -39,6 +39,9 @@ from eintelligence.backbone.ssl4eo_lite_backbone import SSL4EOLiteConfig, MultiS
 from eintelligence.adapters.deforestation_change import DeforestationChangeAdapter
 from eintelligence.analytics.deforestation import deforestation_summary
 
+# Kernel
+from eintelligence.fusion.kernel_base import BaseFusionKernel, MultisensorIdentityFusionKernel
+
 # ---------- small utils copied from your single-sensor ----------
 def _save_mask_like(src_tile_path: Path, mask_uint8: np.ndarray, out_path: Path) -> None:
     with rasterio.open(src_tile_path) as src:
@@ -124,7 +127,7 @@ class _TrainerMS:
         return bce + dice.mean()
 
 
-    def _step(self, batch: Dict, backbone: MultiSensorSSL4EOLiteBackbone, adapter: DeforestationChangeAdapter,
+    def _step(self, batch: Dict, fusion_kernel: BaseFusionKernel, adapter: DeforestationChangeAdapter,
               optimizer=None, train=True) -> float:
         target = batch["target"].to(self.device).float()
         for t in ("t0","t1"):
@@ -133,7 +136,7 @@ class _TrainerMS:
                     batch[t][m] = batch[t][m].to(self.device, non_blocking=True)
 
         with torch.set_grad_enabled(train), autocast(enabled=(self.device.type=="cuda" and self.cfg.amp)):
-            out = adapter(batch, backbone)
+            out = adapter(batch, fusion_kernel)
             logits = out["logits"]
             # 🔧 ensure logits match target HxW
             if logits.shape[-2:] != target.shape[-2:]:
@@ -149,7 +152,7 @@ class _TrainerMS:
 
         return float(loss.item())
 
-    def fit(self, dataset, backbone: MultiSensorSSL4EOLiteBackbone,
+    def fit(self, dataset, fusion_kernel: BaseFusionKernel,
             adapter: DeforestationChangeAdapter, ckpt_path: Path, collate_fn=None) -> None:
         n_val = int(len(dataset) * self.cfg.val_fraction)
         n_train = len(dataset) - n_val
@@ -174,17 +177,17 @@ class _TrainerMS:
         for e in range(self.cfg.num_epochs):
             # train
             tr_total = 0.0
-            backbone.eval(); adapter.train()
+            fusion_kernel.eval(); adapter.train()
             for batch in train_loader:
-                tr_total += self._step(batch, backbone, adapter, optimizer, train=True) * batch["target"].size(0)
+                tr_total += self._step(batch, fusion_kernel, adapter, optimizer, train=True) * batch["target"].size(0)
             tr_loss = tr_total / len(train_loader.dataset)
 
             # val
             vl_total = 0.0
-            backbone.eval(); adapter.eval()
+            fusion_kernel.eval(); adapter.eval()
             with torch.no_grad():
                 for batch in val_loader:
-                    vl_total += self._step(batch, backbone, adapter, optimizer=None, train=False) * batch["target"].size(0)
+                    vl_total += self._step(batch, fusion_kernel, adapter, optimizer=None, train=False) * batch["target"].size(0)
             vl_loss = vl_total / len(val_loader.dataset)
 
             print(f"[epoch {e:02d}] train={tr_loss:.4f}  val={vl_loss:.4f}")
@@ -255,6 +258,13 @@ class DeforestationWorkflowMS:
 
         self.adapter = DeforestationChangeAdapter(c_backbone=512, c_align=256).to(self.device)
 
+        if mode == "s2":
+            self.fusion_kernel = MultisensorIdentityFusionKernel(backbone=self.backbone).to(self.device)
+        elif mode == "s1":
+            self.fusion_kernel = MultisensorIdentityFusionKernel(backbone=self.backbone).to(self.device)
+        else:  # "s1s2"
+            self.fusion_kernel = MultisensorIdentityFusionKernel(backbone=self.backbone).to(self.device)
+
     # ---- Build / Resume ----
     def build_data(self, aoi_geojson: Dict[str, Any], start: str, end: str, region_name: str) -> Path:
         mode = self.tcfg.sensor_mode
@@ -317,7 +327,7 @@ class DeforestationWorkflowMS:
 
         if mode == "s1s2":
             ds = MultiSensorChangeDataset(pairs_manifest, tile_size=self.tcfg.tile_size)
-            self.trainer.fit(ds, self.backbone, self.adapter, ckpt_path, collate_fn=collate_change)
+            self.trainer.fit(ds, self.fusion_kernel, self.adapter, ckpt_path, collate_fn=collate_change)
 
         elif mode == "s2":
             # Wrap your existing S2 dataset into dict form
@@ -327,7 +337,7 @@ class DeforestationWorkflowMS:
                                               tile_size=self.tcfg.tile_size)
             ds = S2DictDataset(base)
             # simple collate (PyTorch default is fine for this dict of tensors)
-            self.trainer.fit(ds, self.backbone, self.adapter, ckpt_path, collate_fn=None)
+            self.trainer.fit(ds, self.fusion_kernel, self.adapter, ckpt_path, collate_fn=None)
 
         else:  # "s1"
             # We typically don't have labels for S1-only deforestation (no NDVI).
@@ -394,7 +404,7 @@ class DeforestationWorkflowMS:
                 with autocast(enabled=(self.device.type=="cuda")):
                     # out = self.adapter(batch, self.backbone)
                     # prob = torch.sigmoid(out["logits"]).float().cpu().numpy()[0,0]
-                    out = self.adapter(batch, self.backbone)
+                    out = self.adapter(batch, self.fusion_kernel)
                     logits = out["logits"]
                     # 🔧 upsample logits to full tile size
                     if logits.shape[-2:] != (H, W):
@@ -438,7 +448,7 @@ class DeforestationWorkflowMS:
                     "target": torch.zeros(1,1,H,W, device=self.device)  # not used
                 }
                 with autocast(enabled=(self.device.type=="cuda")):
-                    out = self.adapter(batch, self.backbone)
+                    out = self.adapter(batch, self.fusion_kernel)
                     logits = out["logits"]
                     # 🔧 upsample logits to full tile size
                     if logits.shape[-2:] != (H, W):
@@ -479,7 +489,7 @@ class DeforestationWorkflowMS:
                     "target": torch.zeros(1,1,A.shape[1],A.shape[2]).to(self.device)
                 }
                 with autocast(enabled=(self.device.type=="cuda")):
-                    out = self.adapter(batch, self.backbone)
+                    out = self.adapter(batch, self.fusion_kernel)
                     prob = torch.sigmoid(out["logits"]).float().cpu().numpy()[0,0]
 
                 # No NDVI; analytics without forest gating (or pass external landcover)
