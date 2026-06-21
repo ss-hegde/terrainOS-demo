@@ -1,10 +1,24 @@
 import json
+import math
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 from datetime import datetime
+
+import numpy as np
+
+import rasterio
+from rasterio.merge import merge
+from rasterio.warp import transform_bounds, reproject, Resampling
+
 from shapely.geometry import shape, box
 from shapely.strtree import STRtree
-from shapely.ops import unary_union
+
+
+from rasterio.windows import from_bounds
+from shapely.ops import transform as shp_transform
+from pyproj import CRS, Transformer
+
+WORLD_COVER_BASE = "https://esa-worldcover.s3.eu-central-1.amazonaws.com"
 
 def _tile_key(props: dict) -> tuple:
     """
@@ -157,79 +171,10 @@ def build_temporal_pairs_relaxed_s1(
     out_path = Path(collection_manifest_path).parent / "pairs_manifest.json"
     out_path.write_text(json.dumps({"pairs": out}, indent=2))
     return out_path
-    
-# def build_temporal_pairs_multisensor(
-#     *,
-#     s2_collection_manifest_path: Path,
-#     s1_collection_manifest_path: Path,
-# ) -> Path:
-    
-#     """
-#     For adjacent S2 scenes (t0,t1) pick nearest-time S1 scenes (t0',t1').
-#     Intersect tile grids across all four, output pairs_manifest_multisensor.json.
-#     """
-#     def _parse(t): return datetime.fromisoformat(t.replace("Z","+00:00"))
 
-#     s2_collection = json.loads(Path(s2_collection_manifest_path).read_text())["scenes"]
-#     s2_collection = sorted(s2_collection, key=lambda e: e["datetime"])
 
-#     s1_collection = json.loads(Path(s1_collection_manifest_path).read_text())["scenes"]
-#     s1_collection = sorted(s1_collection, key=lambda e: e["datetime"])
-
-#     # print("S1 Collection Manifest Path:", s1_collection_manifest_path, "\nS2 Collection Manifest Path:", s2_collection_manifest_path)
-#     print(f"Found {len(s1_collection)} Sentinel-1 scenes and {len(s2_collection)} Sentinel-2 scenes.")
-
-#     def _nearest(s_list, target_iso):
-#         tgt = _parse(target_iso)
-#         best = None
-#         best_dt = None
-
-#         for s in s_list:
-#             d = abs((_parse(s["datetime"]) - tgt).total_seconds())
-#             if best is None or d < best_dt:
-#                 best = s
-#                 best_dt = d
-#         return best
-
-#     def _index(manifest_path: Path):
-#         m = json.loads(Path(manifest_path).read_text())
-#         base = Path(manifest_path).parent
-#         idx = {}
-#         for ft in m["features"]:
-#             props = ft["properties"]
-#             key = _tile_key(props)
-#             idx[key] = str(base / props["path"])
-#         return idx
-    
-#     pairs = []
-
-#     for i in range(len(s2_collection) - 1):
-#         A2, B2 = s2_collection[i], s2_collection[i+1]
-#         A1 = _nearest(s1_collection, A2["datetime"])
-#         B1 = _nearest(s1_collection, B2["datetime"])
-
-#         index_A2 = _index(Path(A2["manifest_path"]))
-#         index_B2 = _index(Path(B2["manifest_path"]))
-#         index_A1 = _index(Path(A1["manifest_path"]))
-#         index_B1 = _index(Path(B1["manifest_path"]))
-
-#         common_keys = set(index_A2.keys()) & set(index_B2.keys()) & set(index_A1.keys()) & set(index_B1.keys())
-#         for (r,c) in common_keys:
-#             pairs.append({
-#                 "row": r, "col": c,
-#                 "t0": {"s2": index_A2[(r,c)], "s1": index_A1[(r,c)]},
-#                 "t1": {"s2": index_B2[(r,c)], "s1": index_B1[(r,c)]},
-#                 "scene_ids": {
-#                     "s2_t0": A2["scene_id"], "s2_t1": B2["scene_id"],
-#                     "s1_t0": A1["scene_id"], "s1_t1": B1["scene_id"],
-#                 }
-#             })
-#     out_path = Path(s2_collection_manifest_path).parent / "pairs_manifest_multisensor.json"
-#     out_path.write_text(json.dumps({"pairs": pairs}, indent=2))
-#     return out_path
 
 def _read_manifest_features(manifest_path: Path):
-    """Return list of (geom, props, abs_path) from a tiles manifest."""
     m = json.loads(Path(manifest_path).read_text())
     base = Path(manifest_path).parent
     feats = []
@@ -240,14 +185,14 @@ def _read_manifest_features(manifest_path: Path):
         feats.append((geom, props, abs_path))
     return feats
 
+
 def _build_spatial_index(feats):
-    """Build an STRtree and a backref list for feats."""
     geoms = [g for g, _, _ in feats]
     tree = STRtree(geoms)
     return tree, geoms
 
+
 def _best_overlap(target_geom, tree: STRtree, geoms: List, feats: List, iou_min=0.8):
-    """Find best-overlap feature by IoU; return (abs_path, props) or (None, None)."""
     cand_idxs = tree.query(target_geom)
     best_iou, best_idx = 0.0, None
     tg_area = target_geom.area if target_geom.area > 0 else 1e-9
@@ -262,6 +207,90 @@ def _best_overlap(target_geom, tree: STRtree, geoms: List, feats: List, iou_min=
         return None, None
     _geom, props, abs_path = feats[best_idx]
     return abs_path, props
+
+
+def _worldcover_tile_name(lon: float, lat: float) -> str:
+    lon0 = math.floor(lon / 3) * 3
+    lat0 = math.floor(lat / 3) * 3
+    ns = "N" if lat0 >= 0 else "S"
+    ew = "E" if lon0 >= 0 else "W"
+    return f"{ns}{abs(lat0):02d}{ew}{abs(lon0):03d}"
+
+
+def _worldcover_urls_for_bounds(bounds_4326, version="v200", year="2021") -> List[str]:
+    minx, miny, maxx, maxy = bounds_4326
+    lon_starts = range(math.floor(minx / 3) * 3, math.floor(maxx / 3) * 3 + 1, 3)
+    lat_starts = range(math.floor(miny / 3) * 3, math.floor(maxy / 3) * 3 + 1, 3)
+
+    urls = []
+    seen = set()
+    for lon0 in lon_starts:
+        for lat0 in lat_starts:
+            tile = _worldcover_tile_name(lon0 + 0.001, lat0 + 0.001)
+            if tile in seen:
+                continue
+            seen.add(tile)
+            fname = f"ESA_WorldCover_10m_{year}_{version}_{tile}_Map.tif"
+            urls.append(f"{WORLD_COVER_BASE}/{version}/{year}/map/{fname}")
+    return urls
+
+
+def _write_aligned_worldcover_label(
+    *,
+    s2_tile_path: Path,
+    out_label_path: Path,
+    worldcover_version: str = "v200",
+    worldcover_year: str = "2021",
+) -> Optional[Path]:
+    with rasterio.open(s2_tile_path) as s2:
+        s2_bounds = s2.bounds
+        s2_crs = s2.crs
+        s2_transform = s2.transform
+        s2_height = s2.height
+        s2_width = s2.width
+        s2_profile = s2.profile.copy()
+
+        bounds_4326 = transform_bounds(s2_crs, "EPSG:4326", *s2_bounds, densify_pts=21)
+        wc_urls = _worldcover_urls_for_bounds(
+            bounds_4326, version=worldcover_version, year=worldcover_year
+        )
+
+        srcs = []
+        for url in wc_urls:
+            try:
+                srcs.append(rasterio.open(url))
+            except Exception:
+                continue
+
+        if not srcs:
+            return None
+
+        try:
+            mosaic, mosaic_transform = merge(srcs, bounds=bounds_4326)
+            src_arr = mosaic[0]
+
+            dst_arr = np.zeros((s2_height, s2_width), dtype=np.uint8)
+            reproject(
+                source=src_arr,
+                destination=dst_arr,
+                src_transform=mosaic_transform,
+                src_crs="EPSG:4326",
+                dst_transform=s2_transform,
+                dst_crs=s2_crs,
+                resampling=Resampling.nearest,
+            )
+
+            out_label_path.parent.mkdir(parents=True, exist_ok=True)
+            s2_profile.update(count=1, dtype="uint8", compress="deflate", nodata=0)
+
+            with rasterio.open(out_label_path, "w", **s2_profile) as dst:
+                dst.write(dst_arr, 1)
+
+            return out_label_path
+        finally:
+            for src in srcs:
+                src.close()
+
 
 def build_temporal_pairs_multisensor(
     *,
@@ -355,4 +384,95 @@ def build_temporal_pairs_multisensor(
     # helpful log if empty
     if not pairs:
         print("[WARN] multisensor pairing produced 0 pairs. Consider lowering iou_min or checking AOI alignment.")
+    return out_path
+
+def build_landcover_multisensor_manifest(
+    *,
+    s2_collection_manifest_path: Path,
+    s1_collection_manifest_path: Path,
+    iou_min: float = 0.8,
+    worldcover_version: str = "v200",
+    worldcover_year: str = "2021",
+) -> Path:
+    def _parse_iso(t: str) -> datetime:
+        return datetime.fromisoformat(str(t).replace("Z", "+00:00"))
+
+    s2_collection = json.loads(Path(s2_collection_manifest_path).read_text())["scenes"]
+    s1_collection = json.loads(Path(s1_collection_manifest_path).read_text())["scenes"]
+
+    if not s2_collection or not s1_collection:
+        raise RuntimeError("Empty S2 or S1 collection for landcover multisensor manifest.")
+
+    s2_collection = sorted(s2_collection, key=lambda e: e["datetime"])
+    s1_collection = sorted(s1_collection, key=lambda e: e["datetime"])
+
+    def nearest_s1_scene(target_iso: str) -> Dict:
+        tgt = _parse_iso(target_iso)
+        best, best_dt = None, None
+        for s in s1_collection:
+            dt = abs((_parse_iso(s["datetime"]) - tgt).total_seconds())
+            if best is None or dt < best_dt:
+                best, best_dt = s, dt
+        return best
+
+    tiles_out: List[Dict] = []
+
+    for s2_scene in s2_collection:
+        s1_scene = nearest_s1_scene(s2_scene["datetime"])
+        feats_s2 = _read_manifest_features(Path(s2_scene["manifest_path"]))
+        feats_s1 = _read_manifest_features(Path(s1_scene["manifest_path"]))
+        tree_s1, geoms_s1 = _build_spatial_index(feats_s1)
+
+        for geom_s2, props_s2, s2_path in feats_s2:
+            s1_path, _ = _best_overlap(
+                target_geom=geom_s2,
+                tree=tree_s1,
+                geoms=geoms_s1,
+                feats=feats_s1,
+                iou_min=iou_min,
+            )
+            if s1_path is None:
+                continue
+
+            s2_tile_path = Path(s2_path)
+            wc_tile_path = s2_tile_path.with_name(s2_tile_path.stem + "_worldcover_aligned.tif")
+
+            wc_written = _write_aligned_worldcover_label(
+                s2_tile_path=s2_tile_path,
+                out_label_path=wc_tile_path,
+                worldcover_version=worldcover_version,
+                worldcover_year=worldcover_year,
+            )
+            if wc_written is None:
+                continue
+
+            with rasterio.open(s2_tile_path) as s2_src:
+                H, W = s2_src.height, s2_src.width
+
+            row_off = int(props_s2["row_off"])
+            col_off = int(props_s2["col_off"])
+            step = int(props_s2.get("stride", props_s2.get("size", 1)))
+            step = max(step, 1)
+            row_idx = row_off // step
+            col_idx = col_off // step
+
+            tiles_out.append({
+                "tile_id": f"{s2_scene['scene_id']}_{row_idx}_{col_idx}",
+                "s2_path": s2_path,
+                "s1_path": s1_path,
+                "worldcover_path": str(wc_written),
+                "height": int(H),
+                "width": int(W),
+                "datetime": s2_scene["datetime"],
+                "row": row_idx,
+                "col": col_idx,
+            })
+
+    out_path = Path(s2_collection_manifest_path).parent / "landcover_manifest_multisensor.json"
+    out_path.write_text(json.dumps({"tiles": tiles_out}, indent=2))
+
+    if not tiles_out:
+        print("[WARN] build_landcover_multisensor_manifest produced 0 tiles.")
+    else:
+        print(f"[INFO] Landcover multisensor manifest written to {out_path} with {len(tiles_out)} tiles.")
     return out_path

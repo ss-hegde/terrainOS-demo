@@ -43,7 +43,8 @@ def _iter_windows_subset(H, W, tile, stride, row0, col0, h_sub, w_sub):
         win_h = min(tile, (row0 + h_sub) - r)
         while c < col0 + w_sub:
             win_w = min(tile, (col0 + w_sub) - c)
-            yield rwin.Window(c, r, win_w, win_h)
+            if win_h == tile and win_w == tile:
+                yield rwin.Window(c, r, win_w, win_h)
             c += step
         r += step
 
