@@ -1,65 +1,200 @@
 from __future__ import annotations
 from datetime import date, datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple, Sequence
-from shapely.geometry import Point, mapping, shape, box
+from typing import List, Optional, Tuple
+import time
+
+from shapely.geometry import shape, box
 from pystac_client import Client
+from pystac_client.exceptions import APIError
 import planetary_computer
+
 
 stac_api_url = "https://planetarycomputer.microsoft.com/api/stac/v1"
 
+
+def _normalize_geom(aoi_geojson_or_geom):
+    if isinstance(aoi_geojson_or_geom, dict):
+        return aoi_geojson_or_geom.get("geometry", aoi_geojson_or_geom)
+    return aoi_geojson_or_geom
+
+
+def _geom_to_bbox(geom) -> Tuple[float, float, float, float]:
+    g = shape(geom) if isinstance(geom, dict) else geom
+    return g.bounds
+
+
+def _split_bbox_if_large(bbox, max_side_deg=0.15):
+    minx, miny, maxx, maxy = bbox
+    width = maxx - minx
+    height = maxy - miny
+
+    nx = max(1, int((width / max_side_deg) + 0.999))
+    ny = max(1, int((height / max_side_deg) + 0.999))
+
+    dx = width / nx
+    dy = height / ny
+
+    tiles = []
+    for ix in range(nx):
+        for iy in range(ny):
+            x0 = minx + ix * dx
+            x1 = minx + (ix + 1) * dx
+            y0 = miny + iy * dy
+            y1 = miny + (iy + 1) * dy
+            tiles.append((x0, y0, x1, y1))
+    return tiles
+
+
+def _run_search_with_retry(catalog, *, bbox, start_date, end_date, max_cloud, page_limit, retries=5, base_sleep=2.0):
+    last_err = None
+    for attempt in range(retries):
+        try:
+            search = catalog.search(
+                collections=["sentinel-2-l2a"],
+                bbox=bbox,
+                datetime=f"{start_date}/{end_date}",
+                query={"eo:cloud_cover": {"lt": max_cloud}},
+                limit=page_limit,
+            )
+            return list(search.items())
+        except APIError as e:
+            last_err = e
+            msg = str(e).lower()
+            if "maximum allowed time" not in msg and "503" not in msg and "504" not in msg:
+                raise
+            sleep_s = base_sleep * (2 ** attempt)
+            print(f"S2 STAC timeout/retry {attempt+1}/{retries} for bbox={bbox}; sleeping {sleep_s:.1f}s")
+            time.sleep(sleep_s)
+
+    raise last_err
+
+
 def search_s2_items(
-        aoi_geojson_or_geom,
-        start_date: str | date,
-        end_date: str | date,
-        max_cloud: int = 20,
-        limit: Optional[int] = None,
-        same_mgrs_tile: bool = True
+    aoi_geojson_or_geom,
+    start_date: str | date,
+    end_date: str | date,
+    max_cloud: int = 20,
+    limit: Optional[int] = None,
+    same_mgrs_tile: bool = True,
+    page_limit: int = 100,
+    split_large_aoi: bool = True,
+    max_side_deg: float = 0.15,
 ) -> List:
-    
-    """Search for Sentinel-2 items in a given area and date range.
-
-    Args:
-        stac_api_url (str): URL of the STAC API.
-        aoi_geojson: GeoJSON geometry of the area of interest.
-        start_date (str | date): Start date for the search (YYYY-MM-DD).
-        end_date (str | date): End date for the search (YYYY-MM-DD).
-        max_cloud (int, optional): Maximum cloud cover percentage. Defaults to 20.
-        limit (Optional[int], optional): Maximum number of items to return. Defaults to None.
-        same_mgrs_tile (bool, optional): If True, only return items from the same MGRS tile. Defaults to True.
-
-    Returns:
-        List: List of STAC items matching the search criteria.
+    """
+    Robust Sentinel-2 search for Planetary Computer:
+    - uses bbox instead of intersects for speed/stability
+    - retries with exponential backoff on API timeouts
+    - optionally splits larger AOIs into smaller bbox searches
     """
     catalog = Client.open(stac_api_url, modifier=planetary_computer.sign_inplace)
-    
-    geom = (aoi_geojson_or_geom.get("geometry") if isinstance(aoi_geojson_or_geom, dict)
-            and "type" in aoi_geojson_or_geom and aoi_geojson_or_geom["type"] != "Polygon"
-            else aoi_geojson_or_geom)
 
-    search = catalog.search(
-        collections=["sentinel-2-l2a"],
-        intersects=geom,
-        datetime=f"{start_date}/{end_date}",
-        query={"eo:cloud_cover": {"lt": max_cloud}},
-    )
+    geom = _normalize_geom(aoi_geojson_or_geom)
+    bbox = _geom_to_bbox(geom)
 
-    items = list(search.items())
-    if not items:
+    bboxes = [bbox]
+    if split_large_aoi:
+        bboxes = _split_bbox_if_large(bbox, max_side_deg=max_side_deg)
+
+    all_items = []
+    seen_ids = set()
+
+    for bb in bboxes:
+        items = _run_search_with_retry(
+            catalog,
+            bbox=bb,
+            start_date=start_date,
+            end_date=end_date,
+            max_cloud=max_cloud,
+            page_limit=page_limit,
+        )
+        for item in items:
+            if item.id not in seen_ids:
+                seen_ids.add(item.id)
+                all_items.append(item)
+
+    if not all_items:
         return []
-    
+
     if same_mgrs_tile:
         counts = {}
-        for item in items:
+        for item in all_items:
             t = item.properties.get("s2:mgrs_tile")
-            counts[t] = counts.get(t, 0) + 1
-        winner = max(counts, key=counts.get)
-        items = [item for item in items if item.properties.get("s2:mgrs_tile") == winner]
+            if t is not None:
+                counts[t] = counts.get(t, 0) + 1
 
-    # Sort by time
-    items.sort(key=lambda i: i.properties.get("datetime"))
+        if counts:
+            winner = max(counts, key=counts.get)
+            all_items = [item for item in all_items if item.properties.get("s2:mgrs_tile") == winner]
 
-    if limit: items = items[:limit]
-    return items
+    all_items.sort(key=lambda i: i.properties.get("datetime"))
+
+    if limit is not None:
+        all_items = all_items[:limit]
+
+    return all_items
+
+# from __future__ import annotations
+# from datetime import date, datetime, timedelta
+# from typing import Any, Dict, List, Optional, Tuple, Sequence
+# from shapely.geometry import Point, mapping, shape, box
+# from pystac_client import Client
+# import planetary_computer
+
+# stac_api_url = "https://planetarycomputer.microsoft.com/api/stac/v1"
+
+# def search_s2_items(
+#         aoi_geojson_or_geom,
+#         start_date: str | date,
+#         end_date: str | date,
+#         max_cloud: int = 20,
+#         limit: Optional[int] = None,
+#         same_mgrs_tile: bool = True
+# ) -> List:
+    
+#     """Search for Sentinel-2 items in a given area and date range.
+
+#     Args:
+#         stac_api_url (str): URL of the STAC API.
+#         aoi_geojson: GeoJSON geometry of the area of interest.
+#         start_date (str | date): Start date for the search (YYYY-MM-DD).
+#         end_date (str | date): End date for the search (YYYY-MM-DD).
+#         max_cloud (int, optional): Maximum cloud cover percentage. Defaults to 20.
+#         limit (Optional[int], optional): Maximum number of items to return. Defaults to None.
+#         same_mgrs_tile (bool, optional): If True, only return items from the same MGRS tile. Defaults to True.
+
+#     Returns:
+#         List: List of STAC items matching the search criteria.
+#     """
+#     catalog = Client.open(stac_api_url, modifier=planetary_computer.sign_inplace)
+    
+#     geom = (aoi_geojson_or_geom.get("geometry") if isinstance(aoi_geojson_or_geom, dict)
+#             and "type" in aoi_geojson_or_geom and aoi_geojson_or_geom["type"] != "Polygon"
+#             else aoi_geojson_or_geom)
+
+#     search = catalog.search(
+#         collections=["sentinel-2-l2a"],
+#         intersects=geom,
+#         datetime=f"{start_date}/{end_date}",
+#         query={"eo:cloud_cover": {"lt": max_cloud}},
+#     )
+
+#     items = list(search.items())
+#     if not items:
+#         return []
+    
+#     if same_mgrs_tile:
+#         counts = {}
+#         for item in items:
+#             t = item.properties.get("s2:mgrs_tile")
+#             counts[t] = counts.get(t, 0) + 1
+#         winner = max(counts, key=counts.get)
+#         items = [item for item in items if item.properties.get("s2:mgrs_tile") == winner]
+
+#     # Sort by time
+#     items.sort(key=lambda i: i.properties.get("datetime"))
+
+#     if limit: items = items[:limit]
+#     return items
 
 def search_s1_items(
         aoi_geojson_or_geom,

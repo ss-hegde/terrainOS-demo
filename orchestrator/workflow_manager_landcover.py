@@ -51,6 +51,14 @@ DEBUG_MODE = False
 
 # ---------- small utils (save mask, RGB, quicklook) ----------
 
+LANDCOVER_COLORS = {
+    0: (0.0, 0.4, 0.0),    # forest
+    1: (0.9, 0.9, 0.2),    # cropland/grass
+    2: (0.8, 0.2, 0.2),    # built-up
+    3: (0.2, 0.4, 0.9),    # water
+    4: (0.6, 0.4, 0.2),    # bare land
+    5: (0.6, 0.8, 0.6),    # shrub/other
+}
 
 def _save_mask_like(src_tile_path: Path, mask_uint8: np.ndarray, out_path: Path) -> None:
     with rasterio.open(src_tile_path) as src:
@@ -90,6 +98,71 @@ def _save_quicklook_png_landcover(pred_classes: np.ndarray, out_png: Path) -> No
     plt.savefig(out_png, bbox_inches="tight", pad_inches=0)
     plt.close()
 
+def _mask_to_rgb(mask: np.ndarray, color_map: dict[int, tuple[float, float, float]]) -> np.ndarray:
+    h, w = mask.shape
+    rgb = np.zeros((h, w, 3), dtype=np.float32)
+    for cls, color in color_map.items():
+        rgb[mask == cls] = color
+    return rgb
+
+def _percentile_stretch(rgb: np.ndarray, low=2, high=98) -> np.ndarray:
+    rgb = rgb.astype(np.float32)
+    out = np.zeros_like(rgb, dtype=np.float32)
+    for c in range(rgb.shape[2]):
+        band = rgb[:, :, c]
+        lo, hi = np.percentile(band[np.isfinite(band)], [low, high])
+        if hi <= lo:
+            out[:, :, c] = 0
+        else:
+            out[:, :, c] = np.clip((band - lo) / (hi - lo), 0, 1)
+    return out
+
+def _read_s2_rgb(s2_path: Path) -> np.ndarray:
+    with rasterio.open(s2_path) as src:
+        count = src.count
+
+        if count >= 4:
+            blue = src.read(1).astype(np.float32)
+            green = src.read(2).astype(np.float32)
+            red = src.read(3).astype(np.float32)
+            rgb = np.dstack([red, green, blue])
+        elif count >= 3:
+            arr = src.read([1, 2, 3]).astype(np.float32)
+            rgb = np.transpose(arr, (1, 2, 0))
+        else:
+            raise RuntimeError(f"Expected at least 3 bands in {s2_path}, got {count}")
+
+    return _percentile_stretch(rgb)
+
+def _save_side_by_side_quicklook_landcover(
+    s2_path: Path,
+    gt_mask: np.ndarray,
+    pred_mask: np.ndarray,
+    out_png: Path,
+    color_map: dict[int, tuple[float, float, float]] = LANDCOVER_COLORS,
+) -> None:
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+
+    s2_rgb = _read_s2_rgb(s2_path)
+    gt_rgb = _mask_to_rgb(gt_mask, color_map)
+    pred_rgb = _mask_to_rgb(pred_mask, color_map)
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5), constrained_layout=True)
+
+    axes[0].imshow(s2_rgb)
+    axes[0].set_title("S2 RGB")
+    axes[0].axis("off")
+
+    axes[1].imshow(gt_rgb)
+    axes[1].set_title("Ground Truth")
+    axes[1].axis("off")
+
+    axes[2].imshow(pred_rgb)
+    axes[2].set_title("Prediction")
+    axes[2].axis("off")
+
+    fig.savefig(out_png, dpi=150, bbox_inches="tight")
+    plt.close(fig)
 
 # ---------- Configs ----------
 
@@ -532,16 +605,38 @@ class LandCoverWorkflowMS:
                 logits = self.head(fusion_out, out_size=(H, W))
                 probs = torch.softmax(logits, dim=1).cpu().numpy()[0]  # [C, H, W]
 
-            pred_classes = probs.argmax(axis=0).astype(np.uint8)  # [H,W]
+            pred_classes = probs.argmax(axis=0).astype(np.uint8)  # [H, W]
 
-            # Save predicted map as a GeoTIFF aligned to the S2 tile
             out_mask = out_dir / (s2_path.stem + "_landcover_pred.tif")
             _save_mask_like(s2_path, pred_classes, out_mask)
 
-            # Optional quicklook: class map as PNG
             png_dir = out_dir / "quicklooks"
-            png_path = png_dir / (s2_path.stem + "_landcover_pred.png")
-            _save_quicklook_png_landcover(pred_classes, png_path)
+            png_dir.mkdir(parents=True, exist_ok=True)
+
+            pred_png_path = png_dir / (s2_path.stem + "_landcover_pred.png")
+            _save_quicklook_png_landcover(pred_classes, pred_png_path)
+
+            gt = sample.get("labels", None)
+            if gt is not None:
+                gt_mask = gt.cpu().numpy()[0].astype(np.uint8)
+                
+                compare_png_path = png_dir / (s2_path.stem + "_rgb_gt_pred.png")
+                _save_side_by_side_quicklook_landcover(
+                    s2_path=s2_path,
+                    gt_mask=gt_mask,
+                    pred_mask=pred_classes,
+                    out_png=compare_png_path,
+                )
+            else:
+                print("No label found in sample; skipping GT comparison quicklook.")
+
+            compare_png_path = png_dir / (s2_path.stem + "_rgb_gt_pred.png")
+            _save_side_by_side_quicklook_landcover(
+                s2_path=s2_path,
+                gt_mask=gt_mask,
+                pred_mask=pred_classes,
+                out_png=compare_png_path,
+            )
 
             saved += 1
             if saved >= max_tiles:
