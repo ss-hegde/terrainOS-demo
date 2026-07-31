@@ -15,6 +15,7 @@ from eintelligence.data_prep.worldcover_labels import (
     REDUCED_LC_IGNORE,
 )
 
+
 CURL_ENV = dict(
     GDAL_DISABLE_READDIR_ON_OPEN="YES",
     CPL_VSIL_CURL_ALLOWED_EXTENSIONS=".tif",
@@ -27,6 +28,7 @@ CURL_ENV = dict(
 @dataclass
 class LandCoverTileRecord:
     tile_id: str
+    scene_id: str
     s1_path: Path
     s2_path: Path
     worldcover_path: Path
@@ -35,23 +37,42 @@ class LandCoverTileRecord:
     datetime: str
     row: int
     col: int
+    aoi_id: Optional[str] = None
+    job_id: Optional[str] = None
+    group_id: Optional[str] = None
 
 
 class LandCoverDataset(Dataset):
     """
-    Dataset yielding:
+    Tile-level land-cover dataset.
+
+    Expected manifest format:
+    {
+      "tiles": [
+        {
+          "tile_id": "...",
+          "scene_id": "...",
+          "s1_path": "...",
+          "s2_path": "...",
+          "worldcover_path": "...",
+          "height": 256,
+          "width": 256,
+          "datetime": "...",
+          "row": 0,
+          "col": 0,
+          "aoi_id": "...",      # optional
+          "job_id": "...",      # optional
+          "group_id": "..."     # optional
+        }
+      ]
+    }
+
+    Yields:
       {
         "fusion_batch": FusionBatch,
         "labels": LongTensor[H, W],
         "valid_mask": BoolTensor[H, W],
       }
-
-    This version:
-    - reads rasters with masked=True
-    - scales Sentinel-2 DN -> reflectance
-    - optionally normalizes S2
-    - cleans non-finite / extreme Sentinel-1 values
-    - builds real modality masks instead of all-ones masks
     """
 
     def __init__(
@@ -62,9 +83,9 @@ class LandCoverDataset(Dataset):
         normalize_s2: bool = True,
         s2_mean: Tuple[float, ...] = (0.12, 0.14, 0.16, 0.28),
         s2_std: Tuple[float, ...] = (0.08, 0.07, 0.08, 0.10),
-        s1_clip_min: Optional[float] = None,
+        s1_clip_min: Optional[float] = 0.0,
         s1_clip_max: Optional[float] = None,
-        s1_log1p: bool = False,
+        s1_log1p: bool = True,
         s1_replace_value: float = 0.0,
     ):
         self.manifest_path = Path(manifest_path)
@@ -81,34 +102,51 @@ class LandCoverDataset(Dataset):
         self.s1_replace_value = float(s1_replace_value)
 
         data = json.loads(self.manifest_path.read_text())
-        entries = data["tiles"]
+        entries = data.get("tiles")
+        if entries is None:
+            raise RuntimeError(
+                f"Unsupported landcover manifest format in {self.manifest_path}: expected top-level key 'tiles'."
+            )
 
         for e in entries:
-            if tile_size is not None and (e["height"] != tile_size or e["width"] != tile_size):
+            h = int(e["height"])
+            w = int(e["width"])
+            if tile_size is not None and (h != tile_size or w != tile_size):
                 continue
 
             self.records.append(
                 LandCoverTileRecord(
                     tile_id=e["tile_id"],
+                    scene_id=e.get("scene_id", ""),
                     s1_path=Path(e["s1_path"]),
                     s2_path=Path(e["s2_path"]),
                     worldcover_path=Path(e["worldcover_path"]),
-                    height=e["height"],
-                    width=e["width"],
+                    height=h,
+                    width=w,
                     datetime=e["datetime"],
-                    row=e["row"],
-                    col=e["col"],
+                    row=int(e["row"]),
+                    col=int(e["col"]),
+                    aoi_id=e.get("aoi_id"),
+                    job_id=e.get("job_id"),
+                    group_id=e.get("group_id"),
                 )
+            )
+
+        if not self.records:
+            raise RuntimeError(
+                f"No valid tile records found in {self.manifest_path}. "
+                f"Check tile_size filtering and manifest contents."
             )
 
     def __len__(self) -> int:
         return len(self.records)
 
     def _read_raster_masked(self, path: Path) -> Tuple[np.ma.MaskedArray, np.ndarray, Any]:
-        with rasterio.open(path) as src:
-            arr = src.read(masked=True)
-            dataset_mask = src.dataset_mask() > 0
-            nodata = src.nodata
+        with rasterio.Env(**CURL_ENV):
+            with rasterio.open(path) as src:
+                arr = src.read(masked=True)
+                dataset_mask = src.dataset_mask() > 0
+                nodata = src.nodata
         return arr, dataset_mask, nodata
 
     @staticmethod
@@ -116,7 +154,6 @@ class LandCoverDataset(Dataset):
         if not np.issubdtype(arr.dtype, np.floating):
             arr = arr.astype(np.float32)
         return arr.filled(fill_value).astype(np.float32, copy=False)
-    
 
     def _prepare_s2(self, path: Path) -> Tuple[np.ndarray, np.ndarray]:
         arr_ma, dataset_valid, _ = self._read_raster_masked(path)
@@ -137,31 +174,44 @@ class LandCoverDataset(Dataset):
         arr_ma, dataset_valid, _ = self._read_raster_masked(path)
         arr = self._masked_to_float(arr_ma, fill_value=np.nan)
 
+        arr = arr.astype(np.float32, copy=False)
+
+        # mark obvious junk as invalid early
         arr[~np.isfinite(arr)] = np.nan
         arr[(arr <= -1e10) | (arr >= 1e10)] = np.nan
-        arr = np.clip(arr, -35.0, 5.0)
 
-        # arr[~np.isfinite(arr)] = np.nan
-        # arr[arr > 1e20] = np.nan
-        # arr[arr < -1e20] = np.nan
+        # optional pre-log clipping
+        if self.s1_clip_min is not None or self.s1_clip_max is not None:
+            lo = self.s1_clip_min if self.s1_clip_min is not None else -np.inf
+            hi = self.s1_clip_max if self.s1_clip_max is not None else np.inf
+            arr = np.clip(arr, lo, hi)
 
-        # if self.s1_clip_min is not None or self.s1_clip_max is not None:
-        #     lo = self.s1_clip_min if self.s1_clip_min is not None else -np.inf
-        #     hi = self.s1_clip_max if self.s1_clip_max is not None else np.inf
-        #     arr = np.clip(arr, lo, hi)
+        # stabilize positive-heavy S1 magnitudes
+        # if inputs are linear-power-like, log1p compresses the dynamic range strongly
+        if self.s1_log1p:
+            arr = np.log1p(np.clip(arr, 0.0, None))
+        else:
+            arr = np.clip(arr, 0.0, None)
 
-        # if self.s1_log1p:
-        #     arr = np.log1p(np.clip(arr, 0.0, None))
+        # optional post-log clipping to keep a sane range
+        arr = np.clip(arr, 0.0, 25.0)
 
         valid = dataset_valid.astype(bool) & np.isfinite(arr).all(axis=0)
 
-        # arr = np.nan_to_num(
-        #     arr,
-        #     nan=self.s1_replace_value,
-        #     posinf=self.s1_replace_value,
-        #     neginf=self.s1_replace_value,
-        # ).astype(np.float32, copy=False)
-        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+        arr = np.nan_to_num(
+            arr,
+            nan=self.s1_replace_value,
+            posinf=self.s1_replace_value,
+            neginf=self.s1_replace_value,
+        ).astype(np.float32, copy=False)
+
+        if not np.isfinite(arr).all():
+            raise RuntimeError(f"Non-finite S1 after preprocessing: {path}")
+
+        if float(np.abs(arr).max()) > 100.0:
+            raise RuntimeError(
+                f"S1 still too large after preprocessing: {path} max={float(np.abs(arr).max())}"
+            )
 
         return arr, valid
 
@@ -178,7 +228,18 @@ class LandCoverDataset(Dataset):
 
         s1, s1_valid = self._prepare_s1(rec.s1_path)
         s2, s2_valid = self._prepare_s2(rec.s2_path)
-        labels_np, valid_mask_np = self._prepare_labels(rec.worldcover_path)
+        labels_np, label_valid = self._prepare_labels(rec.worldcover_path)
+
+        if s1.shape[1:] != s2.shape[1:]:
+            raise RuntimeError(
+                f"S1/S2 shape mismatch for tile {rec.tile_id}: {s1.shape} vs {s2.shape}"
+            )
+        if labels_np.shape != s2.shape[1:]:
+            raise RuntimeError(
+                f"Label/S2 shape mismatch for tile {rec.tile_id}: {labels_np.shape} vs {s2.shape[1:]}"
+            )
+
+        valid_mask_np = label_valid & s1_valid & s2_valid
 
         imagery = {
             "s1": torch.from_numpy(s1).float(),
@@ -190,11 +251,15 @@ class LandCoverDataset(Dataset):
         }
         meta = {
             "tile_id": rec.tile_id,
+            "scene_id": rec.scene_id,
             "datetime": rec.datetime,
             "row": rec.row,
             "col": rec.col,
             "height": rec.height,
             "width": rec.width,
+            "aoi_id": rec.aoi_id,
+            "job_id": rec.job_id,
+            "group_id": rec.group_id,
             "s1_path": str(rec.s1_path),
             "s2_path": str(rec.s2_path),
             "worldcover_path": str(rec.worldcover_path),

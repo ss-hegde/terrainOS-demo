@@ -21,24 +21,32 @@ def collate_landcover(batch):
     mask_keys = fb_list[0].masks.keys()
 
     imagery = {
-        k: torch.stack([fb.imagery[k] for fb in fb_list], dim=0)   # [B, C, H, W]
+        k: torch.stack([fb.imagery[k] for fb in fb_list], dim=0)
         for k in imagery_keys
     }
     masks = {
-        k: torch.stack([fb.masks[k] for fb in fb_list], dim=0)     # [B, 1, H, W]
+        k: torch.stack([fb.masks[k] for fb in fb_list], dim=0)
         for k in mask_keys
     }
 
+    meta_keys = [
+        "tile_id",
+        "scene_id",
+        "datetime",
+        "row",
+        "col",
+        "height",
+        "width",
+        "aoi_id",
+        "job_id",
+        "group_id",
+        "s1_path",
+        "s2_path",
+        "worldcover_path",
+    ]
     meta = {
-        "tile_id": [fb.meta["tile_id"] for fb in fb_list],
-        "datetime": [fb.meta["datetime"] for fb in fb_list],
-        "row": [fb.meta["row"] for fb in fb_list],
-        "col": [fb.meta["col"] for fb in fb_list],
-        "height": [fb.meta["height"] for fb in fb_list],
-        "width": [fb.meta["width"] for fb in fb_list],
-        "s2_path": [fb.meta["s2_path"] for fb in fb_list],
-        "s1_path": [fb.meta["s1_path"] for fb in fb_list],
-        "worldcover_path": [fb.meta["worldcover_path"] for fb in fb_list],
+        k: [fb.meta.get(k) for fb in fb_list]
+        for k in meta_keys
     }
 
     fusion_batch = FusionBatch(
@@ -49,6 +57,6 @@ def collate_landcover(batch):
 
     return {
         "fusion_batch": fusion_batch,
-        "labels": torch.stack([b["labels"] for b in batch], dim=0),          # [B, H, W]
-        "valid_mask": torch.stack([b["valid_mask"] for b in batch], dim=0),  # [B, H, W]
+        "labels": torch.stack([b["labels"] for b in batch], dim=0),
+        "valid_mask": torch.stack([b["valid_mask"] for b in batch], dim=0),
     }
