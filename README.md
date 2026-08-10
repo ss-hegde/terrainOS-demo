@@ -22,7 +22,7 @@ It is designed as an open, scalable system with five conceptual layers:
 - Change detection adapter combining a ResNet backbone with a U-Net head
 - End-to-end orchestration through the Workflow class
 - Visualization outputs (NDVI checks, GeoTIFF masks, quicklook PNG overlays)
-- FastAPI interface exposing a simple REST endpoint:
+- Fusion of multi-sensor data (Sentinel-1 SAR + Sentinel-2 optical) for improved change detection and land cover monitoring
 
 ``` 
 earth.query(task="deforestation", lat=..., lon=..., start=..., end=...)
@@ -40,6 +40,7 @@ eintelligence/
 │   ├── workflow_manager.py   # End-to-end orchestration logic
 │   ├── api_server.py         # FastAPI implementation (earth.query)
 │   └── ...
+├── fusion/             # Multi-sensor fusion kernel (e.g., S1+S2)
 ├── utils/              # Logging, debugging, and helper tools
 ├── models/             # Trained model checkpoints
 ├── data/               # Downloaded tiles, manifests, predictions
@@ -56,6 +57,7 @@ eintelligence/
 | Adapters | Task-specific heads (U-Net) | `adapters/change_head.py` |
 | Analytics | NDVI and change metrics | `analytics/ndvi.py` |
 | Orchestrator | Manages workflow execution | `orchestrator/workflow_manager.py` |
+| Fusion | Multi-sensor fusion logic | `fusion/fusion_kernel.py` |
 | API Layer | FastAPI serving earth.query() | `orchestrator/api_server.py` |
 
 ---
@@ -97,7 +99,7 @@ else:
     wf = FloodWorkflowS1(project_root, tiling_cfg, TrainingConfig(), skip_to_pairing=False)
 
 # 4. Build multi-scene dataset + temporal pairs
-region = f"munich_{case_name}_{sensor_mode}"
+region = f"location_{case_name}_{sensor_mode}"
 pairs_manifest = wf.build_data(
     aoi_geojson=aoi,
     start="2023-06-01",
@@ -119,7 +121,7 @@ wf.run(pairs_manifest, ckpt_path, out_dir, retrain=False, prob_thresh=0.5)
 After running the workflow, you will find:
 ```
 data/
-  └── munich_deforestation_s1s2/
+  └── location_deforestation_s1s2/
         ├── S1/scene_1/tiles_s1/
         ├── S2/scene_2/tiles_s2/
         ├── collection_manifest.json
@@ -136,16 +138,16 @@ data/
 ## Future Work
 
 ### Implemented
-- Multi-scene Sentinel-2 ingestion via STAC
-- Automated tiling and manifesting
+- Multi-scene Sentinnel-1 and Sentinel-2 ingestion via STAC
+- Automated tiling manifesting, matching S1 and S2 scenes temporally, and pairing for change detection
 - Deforestation adapter (ResNet + U-Net)
+- Land cover classification adapter (ResNet + U-Net)
 - FastAPI endpoint with logging and visualization
 
 ### Next Steps
-- Add Flood Monitoring (Sentinel-1 SAR) adapter
-- Integrate ERA5 reanalysis data (temperature, precipitation)
-- Introduce self-supervised EO backbone (e.g., Prithvi, SatMAE)
-- Deploy via Docker + Kubernetes for scalable serving
+- Integrate additional sensors (e.g., Landsat, MODIS)
+- Introduce self-supervised pretraining for the shared backbone 
+- Add explainability layers
 - Extend earth.query() to handle multi-task inference
 
 ---

@@ -25,6 +25,8 @@ from eintelligence.data_prep.worldcover_labels import REDUCED_LC_IGNORE
 from eintelligence.data_prep.collate import collate_landcover
 from eintelligence.data_prep.registry_manager import grouped_split, save_splits, load_splits
 from eintelligence.data_prep.raster_stitching import stitch_prediction_tree_by_scene
+from eintelligence.data_prep.temporal_pairing import build_landcover_multisensor_manifest
+from eintelligence.data_prep.manifest_utils import merge_record_manifests
 
 from eintelligence.backbone.ssl4eo_lite_backbone import (
     SSL4EOLiteConfig,
@@ -150,6 +152,19 @@ class TrainingConfigLandCover:
     num_epochs: int = 10
     amp: bool = True
     train_mode: TrainMode = "worldcover_supervised"
+
+
+@dataclass
+class TileInferenceResult:
+    """One tile's worth of infer_region() output."""
+
+    tile_id: str
+    scene_id: str
+    pred_mask_path: Path
+    quicklook_path: Path
+    compare_quicklook_path: Optional[Path]  # only set if the tile had a comparable label
+    uncertainty: Optional[float]            # mean of FusionOutput.uncertainty; None if the kernel didn't produce one
+    per_modality: Dict[str, float]          # modality -> mean of FusionOutput.per_modality[modality]
 
 
 @dataclass
@@ -565,7 +580,13 @@ class LandCoverWorkflowMS:
             scene_id = fb.meta.get("scene_id")
             if isinstance(scene_id, list):
                 scene_id = scene_id[0]
-            scene_id = str(scene_id or s2_path.parent.name)
+            # manifest tiles built by build_landcover_multisensor_manifest carry no
+            # "scene_id" field, so fall back to the actual per-scene directory:
+            # out_dir/<scene_id>/tiles_s2/<tile>.tif, i.e. two levels above the tile
+            # file. s2_path.parent.name is just the literal "tiles_s2" subdir shared
+            # by every scene -- using it collapses all scenes into one output dir and
+            # silently overwrites same-row/col predictions from different dates.
+            scene_id = str(scene_id or s2_path.parent.parent.name)
 
             group_id = fb.meta.get("group_id")
             if isinstance(group_id, list):
@@ -631,6 +652,219 @@ class LandCoverWorkflowMS:
             print(f"stitched scene mosaics -> {stitched_manifest}")
 
         return split_root
+
+    @torch.inference_mode()
+    def infer_region(
+        self,
+        aoi_geojson: Dict[str, Any],
+        start: str,
+        end: str,
+        ckpt_path: Path,
+        region_name: str,
+        out_dir: Path,
+        aoi_id: Optional[str] = None,
+        job_id: Optional[str] = None,
+        registry_relpath: str = "data/corpus/registry/scenes.jsonl",
+        iou_min: float = 0.8,
+        worldcover_version: str = "v200",
+        worldcover_year: str = "2021",
+        max_tiles: Optional[int] = None,
+        stitch_scenes: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Ingest a fresh AOI/date range end-to-end and run inference over every tile
+        produced, against an already-trained checkpoint for a specific sensor mode.
+
+        For a canvas "run inference on this AOI right now" request: no train/val/test
+        split logic (that's infer_split(), for evaluating a pre-existing manifest
+        split). Never trains -- raises if `ckpt_path` doesn't exist.
+        """
+        ckpt_path = Path(ckpt_path)
+        if not ckpt_path.exists():
+            raise RuntimeError(
+                f"Checkpoint not found for infer_region: {ckpt_path}. "
+                "infer_region never trains -- train a checkpoint first "
+                "(LandCoverWorkflowMS.run(mode='train') or mode='train_and_infer')."
+            )
+
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        # --- ingest + build this request's own tile manifest, same sequence the
+        # notebook uses (regional manifest -> merge into a pooled manifest). Scoped
+        # to out_dir rather than the shared training corpus manifest, so an ad hoc
+        # canvas AOI never gets mixed into the training pool. ---
+        s1_coll, s2_coll, _registry_path = self.ingest_region(
+            aoi_geojson=aoi_geojson,
+            start=start,
+            end=end,
+            region_name=region_name,
+            aoi_id=aoi_id,
+            job_id=job_id,
+            registry_relpath=registry_relpath,
+        )
+
+        regional_manifest = build_landcover_multisensor_manifest(
+            s2_collection_manifest_path=s2_coll,
+            s1_collection_manifest_path=s1_coll,
+            iou_min=iou_min,
+            worldcover_version=worldcover_version,
+            worldcover_year=worldcover_year,
+        )
+
+        request_manifest = merge_record_manifests(
+            manifest_paths=[regional_manifest],
+            out_path=out_dir / f"{region_name}_manifest.json",
+            record_key="tiles",
+            task_name="landcover_multisensor",
+            namespaces=[region_name],
+            fields_to_prefix=("group_id", "tile_id", "scene_id"),
+            set_default_aoi_id=True,
+            deduplicate_on="tile_id",
+            sort_by=("aoi_id", "group_id", "scene_id", "datetime", "row", "col", "tile_id"),
+        )
+
+        # --- inference only, no split ---
+        dataset = LandCoverDataset(request_manifest)
+        self._ensure_head(dataset)
+
+        state = torch.load(ckpt_path, map_location=self.device)
+        self.fusion_kernel.load_state_dict(state["fusion_kernel"])
+        self.head.load_state_dict(state["head"])
+
+        self.fusion_kernel.eval()
+        self.head.eval()
+
+        loader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=collate_landcover)
+
+        tiles_root = out_dir / "tiles"
+        tiles_root.mkdir(parents=True, exist_ok=True)
+
+        tiles: List[TileInferenceResult] = []
+        saved = 0
+
+        for sample in loader:
+            fb = sample["fusion_batch"]
+
+            s2_path_str = fb.meta.get("s2_path")
+            if s2_path_str is None:
+                raise RuntimeError("FusionBatch.meta must contain 's2_path' for inference.")
+            if isinstance(s2_path_str, list):
+                if len(s2_path_str) != 1:
+                    raise RuntimeError(f"Expected one s2_path for batch_size=1, got {len(s2_path_str)}")
+                s2_path_str = s2_path_str[0]
+            s2_path = Path(s2_path_str)
+
+            scene_id = fb.meta.get("scene_id")
+            if isinstance(scene_id, list):
+                scene_id = scene_id[0]
+            # see matching comment in infer_split(): fall back to the real per-scene
+            # directory (two levels above the tile file), not the shared "tiles_s2"
+            # subdir name -- otherwise predictions from different S2 scenes at the
+            # same row/col silently overwrite each other.
+            scene_id = str(scene_id or s2_path.parent.parent.name)
+
+            tile_id = fb.meta.get("tile_id")
+            if isinstance(tile_id, list):
+                tile_id = tile_id[0]
+            tile_id = str(tile_id or s2_path.stem)
+
+            group_id = fb.meta.get("group_id")
+            if isinstance(group_id, list):
+                group_id = group_id[0]
+
+            aoi_id_meta = fb.meta.get("aoi_id")
+            if isinstance(aoi_id_meta, list):
+                aoi_id_meta = aoi_id_meta[0]
+
+            stitch_namespace = str(group_id or aoi_id_meta or scene_id)
+
+            scene_out_dir = tiles_root / stitch_namespace / scene_id
+            scene_out_dir.mkdir(parents=True, exist_ok=True)
+
+            with rasterio.open(s2_path) as src:
+                H, W = src.height, src.width
+
+            for k in fb.imagery:
+                fb.imagery[k] = fb.imagery[k].to(self.device)
+                fb.masks[k] = fb.masks[k].to(self.device)
+
+            with autocast(enabled=(self.device.type == "cuda")):
+                fusion_out = self.fusion_kernel(fb)
+                logits = self.head(fusion_out, out_size=(H, W))
+                probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
+
+            pred_classes = probs.argmax(axis=0).astype(np.uint8)
+
+            # Confidence/xAI panel inputs -- reduced to per-tile summary stats rather
+            # than raw feature maps. uncertainty is None today: LateFusionKernel.forward
+            # always sets FusionOutput.uncertainty=None, so this passes that through
+            # faithfully rather than fabricating a value.
+            uncertainty_mean = (
+                float(fusion_out.uncertainty.float().mean().item())
+                if fusion_out.uncertainty is not None
+                else None
+            )
+            per_modality_mean = {
+                k: float(v.float().mean().item()) for k, v in fusion_out.per_modality.items()
+            }
+
+            out_mask = scene_out_dir / f"{s2_path.stem}_landcover_pred.tif"
+            _save_mask_like(s2_path, pred_classes, out_mask)
+
+            png_dir = scene_out_dir / "quicklooks"
+            png_dir.mkdir(parents=True, exist_ok=True)
+
+            pred_png_path = png_dir / f"{s2_path.stem}_landcover_pred.png"
+            _save_quicklook_png_landcover(pred_classes, pred_png_path)
+
+            compare_png_path = None
+            gt = sample.get("labels")
+            if gt is not None:
+                gt_mask = gt.cpu().numpy()[0].astype(np.uint8)
+                compare_png_path = png_dir / f"{s2_path.stem}_rgb_gt_pred.png"
+                _save_side_by_side_quicklook_landcover(
+                    s2_path=s2_path,
+                    gt_mask=gt_mask,
+                    pred_mask=pred_classes,
+                    out_png=compare_png_path,
+                )
+
+            tiles.append(
+                TileInferenceResult(
+                    tile_id=tile_id,
+                    scene_id=scene_id,
+                    pred_mask_path=out_mask,
+                    quicklook_path=pred_png_path,
+                    compare_quicklook_path=compare_png_path,
+                    uncertainty=uncertainty_mean,
+                    per_modality=per_modality_mean,
+                )
+            )
+
+            saved += 1
+            if max_tiles is not None and saved >= max_tiles:
+                break
+
+        print(f"[infer_region] wrote {saved} land-cover tiles for region='{region_name}' -> {tiles_root}")
+
+        stitched_manifest_path: Optional[Path] = None
+        if stitch_scenes:
+            stitched_root = out_dir / "stitched"
+            stitched_manifest_path = stitch_prediction_tree_by_scene(
+                pred_root=tiles_root,
+                out_dir=stitched_root,
+                color_map=LANDCOVER_COLORS,
+                manifest_path=request_manifest,
+            )
+            print(f"[infer_region] stitched scene mosaics -> {stitched_manifest_path}")
+
+        return {
+            "region_name": region_name,
+            "manifest_path": request_manifest,
+            "tiles": tiles,
+            "stitched_manifest_path": stitched_manifest_path,
+        }
 
     def run(
         self,

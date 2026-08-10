@@ -8,7 +8,9 @@ __pycache__/
 *.pyd
 
 # Ignore the data directory
-data/
+/data/
+
+
 
 # Ignore the following notebooks
 notebooks/test.ipynb
@@ -22,3 +24,8 @@ notebooks/data_fetch_pipeline.ipynb
 notebooks/04_application_workflow_multisensor.ipynb
 
 orchestrator/workflow_manager_multisensor_v0.py
+
+.pytest_cache/
+
+# Ignore Claude files
+CLAUDE.md
