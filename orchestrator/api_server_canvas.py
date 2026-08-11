@@ -5,9 +5,10 @@ Separate from orchestrator/api_server.py (deforestation, workflow_manager.py) --
 this is the newer surface the block-canvas demo frontend talks to. See CLAUDE.md's
 "Current focus: demo-canvas support" section before changing this file:
 
-  - Only ever reaches inference against an already-trained checkpoint -- never
-    triggers training (LandCoverWorkflowMS.infer_region() enforces this itself,
-    raising if the checkpoint doesn't exist).
+  - /canvas/landcover/infer_region only ever reaches inference against an
+    already-trained checkpoint -- never triggers training
+    (LandCoverWorkflowMS.infer_region() enforces this itself, raising if the
+    checkpoint doesn't exist).
   - Every response includes FusionOutput.uncertainty / .per_modality (reduced to
     per-tile mean summary stats by infer_region()) for the canvas's confidence/xAI
     panel, not just the predicted raster.
@@ -15,9 +16,21 @@ this is the newer surface the block-canvas demo frontend talks to. See CLAUDE.md
     trained sensor_mode checkpoint (see LANDCOVER_MODEL_REGISTRY below), not
     dropping a modality from a live request -- there is no single model that
     tolerates that today.
+  - /canvas/landcover/train (added later, see root CLAUDE.md) is the one path that
+    *does* train -- against the existing pooled manifest/splits under data/corpus/,
+    never against a canvas request's own ingested tiles. It writes a fresh,
+    uniquely-named checkpoint under models/ and never touches landcover_s2.pt /
+    landcover_s1s2.pt or LANDCOVER_MODEL_REGISTRY -- closing the
+    train-then-immediately-infer loop is a separate, later step.
 
-Run:
+Run (same pattern CLAUDE.md's "Setup & commands" documents for api_server.py):
     EARTH_PROJECT_ROOT=$(pwd) uvicorn orchestrator.api_server_canvas:app --reload
+
+Host/port are NOT hardcoded here -- there's no `uvicorn.run(...)` call in this file,
+only `app = FastAPI(...)`, so the command above binds to uvicorn's own CLI defaults:
+    host 127.0.0.1, port 8000  ->  http://127.0.0.1:8000
+Override with --host/--port if needed, e.g.:
+    EARTH_PROJECT_ROOT=$(pwd) uvicorn orchestrator.api_server_canvas:app --host 0.0.0.0 --port 8010 --reload
 
 Unlike api_server.py, PROJECT_ROOT here resolves correctly by default (this file
 lives one level under the repo root, not two) -- EARTH_PROJECT_ROOT is still
@@ -28,6 +41,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 import os
+import time
 import uuid
 
 from fastapi import FastAPI, HTTPException
@@ -39,6 +53,7 @@ from orchestrator.workflow_manager_landcover import (
     LandCoverWorkflowMS,
     TilingConfigLandCover,
     TrainingConfigLandCover,
+    ingestion_fingerprint,
 )
 from eintelligence.data_prep.aoi import square_aoi
 
@@ -88,6 +103,20 @@ LANDCOVER_MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
         ),
     },
 }
+
+# The existing pooled training corpus (built by the notebook -- see root CLAUDE.md
+# and notebooks/05_application_workflow_landcover.ipynb's corpus_dir) -- /train
+# trains against this, it never builds a manifest from a canvas request's own
+# ingested tiles the way infer_region() does.
+POOLED_MANIFEST_PATH = DATA_ROOT / "corpus" / "landcover_manifest_multisensor.json"
+POOLED_SPLITS_PATH = DATA_ROOT / "corpus" / "landcover_splits.json"
+
+# This is a live demo -- nobody should be able to kick off a 100-epoch run by
+# accident (or by a future frontend passing through an unvalidated field). 10 is
+# generous enough to see a real mIoU trend on a small canvas-triggered run without
+# tying up the one shared server for an unbounded amount of time.
+MIN_TRAIN_EPOCHS = 1
+MAX_TRAIN_EPOCHS = 10
 
 # ------- request / response schemas -------
 
@@ -143,6 +172,31 @@ class LandCoverInferResponse(BaseModel):
     stitched_manifest_url: Optional[str] = None
     tile_count: int
     tiles: List[TileResult]
+
+
+class LandCoverTrainRequest(BaseModel):
+    sensor_mode: str = Field(
+        ..., description=f"Which sensor_mode's tiling_cfg to train with. One of {sorted(LANDCOVER_MODEL_REGISTRY)}."
+    )
+    epochs: int = Field(
+        ...,
+        ge=MIN_TRAIN_EPOCHS,
+        le=MAX_TRAIN_EPOCHS,
+        description=f"Number of training epochs, bounded to [{MIN_TRAIN_EPOCHS}, {MAX_TRAIN_EPOCHS}] server-side "
+        "-- this is a live shared demo, not a trusted-frontend-only guard.",
+    )
+    lr: float = Field(..., gt=0, description="Learning rate, passed straight to TrainingConfigLandCover.")
+
+
+class LandCoverTrainResponse(BaseModel):
+    checkpoint: str  # filename under models/, e.g. "canvas_train_s2_ab12cd34ef.pt"
+    sensor_mode: str
+    epochs: int
+    lr: float
+    train_loss: float
+    val_loss: float
+    mean_iou: float
+    elapsed_seconds: float
 
 
 # ------- app -------
@@ -211,11 +265,23 @@ def landcover_infer_region(req: LandCoverInferRequest) -> LandCoverInferResponse
     if not ckpt_path.exists():
         raise HTTPException(status_code=500, detail=f"Model checkpoint not found: {ckpt_path}")
 
+    # This request's OUTPUT naming (out_dir, and the region_name echoed in the
+    # response) -- stays UUID-suffixed and unique per request, unchanged from
+    # before. This is what actually guarantees concurrent/repeated calls never
+    # collide on disk; it's completely independent of the ingestion cache below.
     request_id = uuid.uuid4().hex[:10]
-    region_name = f"{req.region_name or 'canvas'}_{request_id}"
-    out_dir = DATA_ROOT / "corpus" / "canvas" / region_name
+    output_region_name = f"{req.region_name or 'canvas'}_{request_id}"
+    out_dir = DATA_ROOT / "corpus" / "canvas" / output_region_name
 
     aoi_geojson = _build_aoi(req.aoi)
+
+    # Ingestion (S1/S2 STAC fetch + tiling) is a separate, shared cache keyed by
+    # what actually determines its output -- see ingestion_fingerprint()/
+    # ingest_region()'s per-sensor manifest reuse. Passing this (not
+    # output_region_name) as infer_region()'s `region_name` is what lets two
+    # requests for the same AOI/dates reuse the same ingested data on disk,
+    # without touching out_dir's per-request uniqueness above.
+    ingest_region_name = ingestion_fingerprint(aoi_geojson, req.start, req.end, entry["tiling_cfg"])
 
     wf = LandCoverWorkflowMS(PROJECT_ROOT, entry["tiling_cfg"], TrainingConfigLandCover())
 
@@ -225,7 +291,7 @@ def landcover_infer_region(req: LandCoverInferRequest) -> LandCoverInferResponse
             start=req.start,
             end=req.end,
             ckpt_path=ckpt_path,
-            region_name=region_name,
+            region_name=ingest_region_name,
             out_dir=out_dir,
             max_tiles=req.max_tiles,
             stitch_scenes=req.stitch_scenes,
@@ -249,7 +315,10 @@ def landcover_infer_region(req: LandCoverInferRequest) -> LandCoverInferResponse
     ]
 
     return LandCoverInferResponse(
-        region_name=result["region_name"],
+        # This request's own unique name, not result["region_name"] -- that now
+        # holds the shared ingestion fingerprint (see ingest_region_name above),
+        # which is an internal cache key, not this request's identity.
+        region_name=output_region_name,
         sensor_mode=req.sensor_mode,
         manifest_url=_to_data_url(result["manifest_path"]),
         stitched_manifest_url=_to_data_url(result["stitched_manifest_path"])
@@ -257,4 +326,70 @@ def landcover_infer_region(req: LandCoverInferRequest) -> LandCoverInferResponse
         else None,
         tile_count=len(tiles),
         tiles=tiles,
+    )
+
+
+@app.post("/canvas/landcover/train", response_model=LandCoverTrainResponse)
+def landcover_train(req: LandCoverTrainRequest) -> LandCoverTrainResponse:
+    """
+    Train a fresh land-cover checkpoint against the existing pooled training corpus
+    (data/corpus/landcover_manifest_multisensor.json + landcover_splits.json --
+    built by the notebook, not by this request). Deliberately separate from
+    infer_region()'s canvas-request ingestion: this never touches a canvas request's
+    own tiles, and infer_region() never touches the pooled corpus -- the two stay on
+    opposite sides of that line.
+
+    Writes to a brand-new, uniquely-named checkpoint under models/ -- never
+    landcover_s2.pt/landcover_s1s2.pt, and this checkpoint is NOT added to
+    LANDCOVER_MODEL_REGISTRY. Wiring a freshly trained checkpoint into inference is a
+    separate, later step (see root CLAUDE.md).
+    """
+    if req.sensor_mode not in LANDCOVER_MODEL_REGISTRY:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown sensor_mode '{req.sensor_mode}'. Available: {sorted(LANDCOVER_MODEL_REGISTRY)}",
+        )
+    entry = LANDCOVER_MODEL_REGISTRY[req.sensor_mode]
+
+    if not POOLED_MANIFEST_PATH.exists() or not POOLED_SPLITS_PATH.exists():
+        raise HTTPException(
+            status_code=500,
+            detail=f"Pooled training corpus not found: {POOLED_MANIFEST_PATH} / {POOLED_SPLITS_PATH}",
+        )
+
+    # New, uniquely-named checkpoint -- see the isolation note in the docstring above.
+    ckpt_path = MODELS_ROOT / f"canvas_train_{req.sensor_mode}_{uuid.uuid4().hex[:10]}.pt"
+
+    # Reuse LANDCOVER_MODEL_REGISTRY's own tiling_cfg for this sensor_mode rather than
+    # constructing a fresh TilingConfigLandCover -- that's exactly how the bands_s1
+    # case mismatch happened before (root CLAUDE.md's sensor_mode gotcha): a
+    # from-scratch TilingConfigLandCover silently reverts to the dataclass's
+    # uppercase ("VV","VH") default instead of the lowercase the checkpoints/STAC
+    # asset keys actually need.
+    #
+    # amp=False explicitly -- TrainingConfigLandCover's own dataclass default is
+    # amp=True, which is the known live-NaN issue (root CLAUDE.md's "Known issue").
+    # Leaving that implicit here would be the same kind of default-trusting mistake.
+    train_cfg = TrainingConfigLandCover(lr=req.lr, num_epochs=req.epochs, amp=False)
+    wf = LandCoverWorkflowMS(PROJECT_ROOT, entry["tiling_cfg"], train_cfg)
+
+    start = time.monotonic()
+    try:
+        metrics = wf.train(POOLED_MANIFEST_PATH, POOLED_SPLITS_PATH, ckpt_path)
+    except RuntimeError as e:
+        # train()/_load_split_indices() raise RuntimeError for expected upstream
+        # failures (empty train/val split, no tile records, etc.) -- same pattern as
+        # infer_region()'s error handling above.
+        raise HTTPException(status_code=502, detail=str(e)) from e
+    elapsed_seconds = time.monotonic() - start
+
+    return LandCoverTrainResponse(
+        checkpoint=ckpt_path.name,
+        sensor_mode=req.sensor_mode,
+        epochs=req.epochs,
+        lr=req.lr,
+        train_loss=metrics.train_loss,
+        val_loss=metrics.val_loss,
+        mean_iou=metrics.mean_iou,
+        elapsed_seconds=elapsed_seconds,
     )

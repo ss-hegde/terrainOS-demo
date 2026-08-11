@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple, Literal, List
 
+import hashlib
 import json
 import numpy as np
 import torch
@@ -155,6 +156,21 @@ class TrainingConfigLandCover:
 
 
 @dataclass
+class TrainMetrics:
+    """
+    What _TrainerLandCover.fit()/LandCoverWorkflowMS.train() return -- the *final*
+    epoch's numbers (not necessarily the best-mIoU epoch, which is what actually gets
+    checkpointed; see fit()'s best_miou tracking below), so a caller can show
+    something concrete after a short canvas-triggered training run rather than a
+    bare 200.
+    """
+
+    train_loss: float
+    val_loss: float
+    mean_iou: float
+
+
+@dataclass
 class TileInferenceResult:
     """One tile's worth of infer_region() output."""
 
@@ -176,6 +192,65 @@ class TilingConfigLandCover:
     max_cloud: int = 20
     same_mgrs_tile: bool = True
     sensor_mode: SensorMode = "s1s2"
+
+
+def _collection_manifest_is_valid(path: Path) -> bool:
+    """
+    Minimal-validity check for a build_s1_data_collection()/
+    build_s2_data_collection() output (`{"scenes": [...]}`, written by
+    eintelligence/data_prep/build_data_collection.py::_build_collection) --
+    exists, parses as JSON, and has at least one scene entry. This is what
+    ingest_region() checks per-sensor to decide whether that sensor's STAC
+    search + tiling can be skipped and the existing manifest reused as-is.
+    """
+    if not path.is_file():
+        return False
+    try:
+        payload = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return False
+    scenes = payload.get("scenes")
+    return isinstance(scenes, list) and len(scenes) > 0
+
+
+def ingestion_fingerprint(
+    aoi_geojson: Dict[str, Any],
+    start: str,
+    end: str,
+    tiling_cfg: TilingConfigLandCover,
+) -> str:
+    """
+    Deterministic fingerprint over everything that actually determines what
+    ingest_region() fetches/tiles: AOI geometry, date range, and the tiling
+    params that feed search_s2_items/search_s1_items and
+    build_s1_data_collection/build_s2_data_collection (max_cloud,
+    same_mgrs_tile, bands_s1, bands_s2, tile_size, stride). Same inputs always
+    produce the same fingerprint; different inputs produce a different one
+    (barring a SHA-256 collision).
+
+    Deliberately excludes sensor_mode: sensor_mode doesn't change what
+    ingest_region() fetches today -- it always pulls both S1 and S2 regardless
+    (see root CLAUDE.md's open item on this) -- so two requests differing only
+    in sensor_mode should, correctly, share the same ingested S1/S2 data.
+
+    Prefixed with "canvas_ingest_" so this can never collide with a real named
+    training region (e.g. "munich_lc_2023_summer") living alongside it under
+    data/.
+    """
+    payload = {
+        "aoi_geojson": aoi_geojson,
+        "start": start,
+        "end": end,
+        "max_cloud": tiling_cfg.max_cloud,
+        "same_mgrs_tile": tiling_cfg.same_mgrs_tile,
+        "bands_s1": list(tiling_cfg.bands_s1),
+        "bands_s2": list(tiling_cfg.bands_s2),
+        "tile_size": tiling_cfg.tile_size,
+        "stride": tiling_cfg.stride,
+    }
+    encoded = json.dumps(payload, sort_keys=True).encode("utf-8")
+    digest = hashlib.sha256(encoded).hexdigest()[:16]
+    return f"canvas_ingest_{digest}"
 
 
 def check_tensor(name, t):
@@ -251,9 +326,11 @@ class _TrainerLandCover:
         fusion_kernel: LateFusionKernel,
         head: LandCoverSegHead,
         ckpt_path: Path,
-    ) -> None:
+    ) -> TrainMetrics:
         if self.cfg.train_mode != "worldcover_supervised":
             raise NotImplementedError("Self-supervised training is not implemented yet.")
+        if self.cfg.num_epochs < 1:
+            raise ValueError(f"num_epochs must be >= 1, got {self.cfg.num_epochs}")
 
         train_loader = DataLoader(
             train_dataset,
@@ -341,6 +418,11 @@ class _TrainerLandCover:
                 )
                 print(f"  ↳ saved best land-cover model to {ckpt_path} (mIoU={best_miou:.3f})")
 
+        # Final epoch's numbers, not best_miou's -- see TrainMetrics' docstring.
+        # tr_loss/vl_loss/metrics are guaranteed bound here since num_epochs >= 1 is
+        # enforced above, so the loop always runs at least once.
+        return TrainMetrics(train_loss=tr_loss, val_loss=vl_loss, mean_iou=metrics.mean_iou)
+
 
 class LandCoverWorkflowMS:
     def __init__(
@@ -357,7 +439,17 @@ class LandCoverWorkflowMS:
         s1_cfg = SSL4EOLiteConfig(in_ch=len(self.tcfg.bands_s1), freeze=False, state_dict=None)
         s2_cfg = SSL4EOLiteConfig(in_ch=len(self.tcfg.bands_s2), freeze=False, state_dict=None)
         backbone = MultiSensorSSL4EOLiteBackbone(s1_cfg=s1_cfg, s2_cfg=s2_cfg)
-        self.fusion_kernel = LateFusionKernel(backbone=backbone, fused_dim=256, use_modalities=["s1", "s2"]).to(self.device)
+        # use_modalities must actually gate fusion by sensor_mode — previously this
+        # was hardcoded to ["s1", "s2"] regardless of tcfg.sensor_mode, so swapping
+        # checkpoints/sensor_mode never changed which modalities were fused (see
+        # CLAUDE.md "Open" item 1).
+        sensor_mode_to_modalities: Dict[SensorMode, List[str]] = {
+            "s1": ["s1"],
+            "s2": ["s2"],
+            "s1s2": ["s1", "s2"],
+        }
+        use_modalities = sensor_mode_to_modalities[self.tcfg.sensor_mode]
+        self.fusion_kernel = LateFusionKernel(backbone=backbone, fused_dim=256, use_modalities=use_modalities).to(self.device)
         self.head: Optional[LandCoverSegHead] = None
 
     def ingest_region(
@@ -378,43 +470,65 @@ class LandCoverWorkflowMS:
         registry_path = self.root / registry_relpath
         registry_path.parent.mkdir(parents=True, exist_ok=True)
 
-        s2_items = search_s2_items(
-            aoi_geojson,
-            start,
-            end,
-            max_cloud=self.tcfg.max_cloud,
-            same_mgrs_tile=self.tcfg.same_mgrs_tile,
-        )
-        if not s2_items:
-            raise RuntimeError("No S2 items found for land-cover workflow.")
+        # Per-sensor cache reuse: if region_name is a fingerprint of the exact
+        # AOI/dates/tiling config (see ingestion_fingerprint()), a prior identical
+        # request already left a valid collection manifest at this exact path --
+        # skip the STAC search + tiling entirely and reuse it. Falls back to a
+        # normal fresh ingest whenever the manifest is missing/empty/corrupt, same
+        # as if this were the first time.
+        s2_manifest_path = region_dir / "S2" / "collection_manifest_s2.json"
+        if _collection_manifest_is_valid(s2_manifest_path):
+            print(
+                f"[ingest_region] S2: reusing existing ingestion for region='{region_name}' "
+                f"-> {s2_manifest_path} (skipped search_s2_items)"
+            )
+            s2_coll = s2_manifest_path
+        else:
+            s2_items = search_s2_items(
+                aoi_geojson,
+                start,
+                end,
+                max_cloud=self.tcfg.max_cloud,
+                same_mgrs_tile=self.tcfg.same_mgrs_tile,
+            )
+            if not s2_items:
+                raise RuntimeError("No S2 items found for land-cover workflow.")
 
-        s2_coll = build_s2_data_collection(
-            s2_items,
-            out_dir=region_dir / "S2",
-            bands=self.tcfg.bands_s2,
-            tile_size=self.tcfg.tile_size,
-            stride=self.tcfg.stride,
-            aoi_geojson=aoi_geojson,
-            aoi_id=aoi_id,
-            job_id=job_id,
-            registry_path=registry_path,
-        )
+            s2_coll = build_s2_data_collection(
+                s2_items,
+                out_dir=region_dir / "S2",
+                bands=self.tcfg.bands_s2,
+                tile_size=self.tcfg.tile_size,
+                stride=self.tcfg.stride,
+                aoi_geojson=aoi_geojson,
+                aoi_id=aoi_id,
+                job_id=job_id,
+                registry_path=registry_path,
+            )
 
-        s1_items = search_s1_items(aoi_geojson, start, end)
-        if not s1_items:
-            raise RuntimeError("No S1 items found for land-cover workflow.")
+        s1_manifest_path = region_dir / "S1" / "collection_manifest_s1.json"
+        if _collection_manifest_is_valid(s1_manifest_path):
+            print(
+                f"[ingest_region] S1: reusing existing ingestion for region='{region_name}' "
+                f"-> {s1_manifest_path} (skipped search_s1_items)"
+            )
+            s1_coll = s1_manifest_path
+        else:
+            s1_items = search_s1_items(aoi_geojson, start, end)
+            if not s1_items:
+                raise RuntimeError("No S1 items found for land-cover workflow.")
 
-        s1_coll = build_s1_data_collection(
-            s1_items,
-            out_dir=region_dir / "S1",
-            bands=self.tcfg.bands_s1,
-            tile_size=self.tcfg.tile_size,
-            stride=self.tcfg.stride,
-            aoi_geojson=aoi_geojson,
-            aoi_id=aoi_id,
-            job_id=job_id,
-            registry_path=registry_path,
-        )
+            s1_coll = build_s1_data_collection(
+                s1_items,
+                out_dir=region_dir / "S1",
+                bands=self.tcfg.bands_s1,
+                tile_size=self.tcfg.tile_size,
+                stride=self.tcfg.stride,
+                aoi_geojson=aoi_geojson,
+                aoi_id=aoi_id,
+                job_id=job_id,
+                registry_path=registry_path,
+            )
 
         return s1_coll, s2_coll, registry_path
 
@@ -504,7 +618,7 @@ class LandCoverWorkflowMS:
         landcover_manifest: Path,
         splits_path: Path,
         ckpt_path: Path,
-    ) -> None:
+    ) -> TrainMetrics:
         print("Training land-cover head (WorldCover-supervised)...")
 
         dataset = LandCoverDataset(landcover_manifest)
@@ -514,7 +628,7 @@ class LandCoverWorkflowMS:
         val_set = Subset(dataset, val_idx)
 
         self._ensure_head(dataset)
-        self.trainer.fit(train_set, val_set, self.fusion_kernel, self.head, ckpt_path)
+        return self.trainer.fit(train_set, val_set, self.fusion_kernel, self.head, ckpt_path)
 
     @torch.inference_mode()
     def infer_split(

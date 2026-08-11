@@ -94,13 +94,23 @@ def main() -> None:
     print(f"tile count: {len(tiles)}")
     print(f"comparison PNGs produced: {n_compare} / {len(tiles)}")
 
-    print("\nfirst few tiles (uncertainty / per_modality):")
-    for t in tiles[:3]:
+    print("\nall tiles (uncertainty / per_modality):")
+    for t in tiles:
         print(
             f"  tile_id={t.tile_id!r} scene_id={t.scene_id!r} "
             f"pred_mask_path={t.pred_mask_path} "
             f"uncertainty={t.uncertainty} per_modality={t.per_modality}"
         )
+
+    # Real proof the sensor_mode="s2" checkpoint actually behaves as s2-only, not
+    # just that infer_region() ran without crashing (CLAUDE.md's sensor_mode-gating
+    # fix + retrain -- verify every tile's per_modality is exactly {"s2"}).
+    bad_tiles = [t for t in tiles if set(t.per_modality.keys()) != {"s2"}]
+    assert not bad_tiles, (
+        f"{len(bad_tiles)}/{len(tiles)} tile(s) have per_modality keys != {{'s2'}}: "
+        + ", ".join(f"{t.tile_id}={sorted(t.per_modality.keys())}" for t in bad_tiles[:5])
+    )
+    print(f"\n[OK] all {len(tiles)} tiles have per_modality keys == {{'s2'}}")
 
 
 if __name__ == "__main__":

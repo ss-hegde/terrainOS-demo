@@ -102,9 +102,17 @@ class LateFusionKernel(BaseFusionKernel):
         fused = self.proj(fused_cat)
         self._check_finite("fused", fused)
 
+        # per_modality must mirror `keys` (the modalities actually selected for
+        # fusion), not the raw backbone output dict `feats` — the backbone may
+        # have computed features for modalities the caller excluded via
+        # use_modalities (e.g. the caller still passed both s1 and s2 in
+        # batch.imagery), and reporting those would misrepresent which sensors
+        # this kernel is actually fusing.
+        per_modality = {k: feats[k] for k in keys}
+
         return FusionOutput(
             fused=fused,
-            per_modality=feats,
+            per_modality=per_modality,
             uncertainty=None,
             aux={},
         )
