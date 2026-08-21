@@ -1,155 +1,91 @@
-# earth-api
+# terrainOS-demo
 
-## Overview
+A V1 technology demonstrator built around **earth-api** (Earth Intelligence Platform),
+a modular pipeline that turns Sentinel-1/2 satellite imagery into environmental
+insights — deforestation, flood, and land-cover mapping.
 
-The Earth Intelligence Platform (earth-api) is a modular, plug-and-play framework that brings together Earth observation (EO) data, Artificial Intelligence (AI), and API orchestration to transform raw satellite imagery into actionable insights.
+The repo is a monorepo with two halves:
 
-It is designed as an open, scalable system with five conceptual layers:
+- **Backend** (`eintelligence/`, `orchestrator/`, repo root) — the EO pipeline itself:
+  fetch imagery → tile it → shared CNN backbone + fusion kernel → task-specific
+  segmentation heads → rule-based analytics → a FastAPI orchestration layer.
+- **Frontend** (`canvas/`) — a Simulink-style drag-and-drop block canvas that wraps the
+  backend and presents it as if it were "a customer's existing EO pipeline." It's the
+  actual artifact of this demo — a personal project, not a production product — so it
+  favors small, honest, hardcoded shortcuts over general infrastructure.
 
-1. Common Data & Preprocessing Layer – Fetches, cleans, and tiles satellite data (Sentinel-1/2, Landsat, ERA5).
-2. Shared Geospatial Backbone – A sensor-agnostic encoder that extracts spatial and temporal features.
-3. Task-Specific Adapters/Heads – Lightweight neural modules for domain tasks (e.g., deforestation, floods, crop stress).
-4. Rules & Analytics Layer – Hybrid rule-based or statistical analysis modules for simple insights.
-5. Orchestrator & API Layer – A unified interface (earth.query()) that enables end-to-end workflow execution via a FastAPI service.
 
 ---
 
-## Current Capabilities
+## Backend: the pipeline
 
--  STAC-based Sentinel-1 + Sentinel-2 ingestion using the Microsoft Planetary Computer API
-- Scene tiling and management as Cloud-Optimized GeoTIFFs (COGs)
-- Temporal pairing of multi-scene satellite imagery
-- Change detection adapter combining a ResNet backbone with a U-Net head
-- End-to-end orchestration through the Workflow class
-- Visualization outputs (NDVI checks, GeoTIFF masks, quicklook PNG overlays)
-- Fusion of multi-sensor data (Sentinel-1 SAR + Sentinel-2 optical) for improved change detection and land cover monitoring
-
-``` 
-earth.query(task="deforestation", lat=..., lon=..., start=..., end=...)
-```
----
-## Architecture
+Five conceptual layers, each its own top-level package:
 
 ```
 eintelligence/
-├── data_prep/          # Layer 1: Fetching, tiling, manifest, and pairing logic
-├── backbone/           # Layer 2: Shared CNN encoder (ResNet)
-├── adapters/           # Layer 3: Task-specific heads (e.g., U-Net for change detection)
-├── analytics/          # Layer 4: Rule-based or hybrid analytics modules
-├── orchestrator/       # Layer 5: Workflows and FastAPI service
-│   ├── workflow_manager.py   # End-to-end orchestration logic
-│   ├── api_server.py         # FastAPI implementation (earth.query)
-│   └── ...
-├── fusion/             # Multi-sensor fusion kernel (e.g., S1+S2)
-├── utils/              # Logging, debugging, and helper tools
-├── models/             # Trained model checkpoints
-├── data/               # Downloaded tiles, manifests, predictions
-└── notebooks/          # Jupyter notebooks for exploration and prototyping
-
-```
----
-## Core Components
-
-| Layer | Description | Key Modules |
-|-------|-------------|-------------|
-| Data & Preprocessing | Fetches and tiles EO data via STAC |`fetch_multi_data.py`, `tiler_streaming.py` |
-| Backbone | Shared encoder (ResNet-based) | `backbone/resnet_encoder.py` |
-| Adapters | Task-specific heads (U-Net) | `adapters/change_head.py` |
-| Analytics | NDVI and change metrics | `analytics/ndvi.py` |
-| Orchestrator | Manages workflow execution | `orchestrator/workflow_manager.py` |
-| Fusion | Multi-sensor fusion logic | `fusion/fusion_kernel.py` |
-| API Layer | FastAPI serving earth.query() | `orchestrator/api_server.py` |
-
----
-## Example Usage (Notebook or Script)
-
-```
-from pathlib import Path
-import os, sys
-
-project_root = os.path.abspath(os.path.join(os.getcwd(), '..'))
-sys.path.append(project_root)
-
-from eintelligence.data_prep.aoi import square_aoi
-from orchestrator.workflow_manager_multisensor_v1 import (
-    DeforestationWorkflowMS, TilingConfigMS, TilingConfigS1,
-    TrainingConfig, FloodWorkflowS1
-)
-
-# 1. Define a 10×10 km AOI (example: Munich, Germany)
-aoi = square_aoi(48.1351, 11.5820)
-
-# 2. Select task + sensor mode
-CASE = 1                   # 0=S2 deforestation, 1=multi-sensor deforestation, 2=flood S1
-sensor_mode = "s1s2"         # "s2", "s1", or "s1s2"
-case_name = "deforestation" if CASE == 1 else "flood"
-
-# 3. Configure workflow
-if CASE == 1:
-    tiling_cfg = TilingConfigMS(
-        bands_s2=("B02","B03","B04","B08"),
-        bands_s1=("vv","vh"),
-        tile_size=256, stride=256,
-        max_cloud=50,
-        sensor_mode=sensor_mode
-    )
-    wf = DeforestationWorkflowMS(project_root, tiling_cfg, TrainingConfig(), skip_to_pairing=True)
-else:
-    tiling_cfg = TilingConfigS1(tile_size=256, stride=256)
-    wf = FloodWorkflowS1(project_root, tiling_cfg, TrainingConfig(), skip_to_pairing=False)
-
-# 4. Build multi-scene dataset + temporal pairs
-region = f"location_{case_name}_{sensor_mode}"
-pairs_manifest = wf.build_data(
-    aoi_geojson=aoi,
-    start="2023-06-01",
-    end="2023-08-01",
-    region_name=region
-)
-
-# 5. Run model inference (or set retrain=True to fine-tune)
-ckpt_path = Path(project_root) / "models" / f"{case_name}_{sensor_mode}_adapter.pt"
-out_dir   = Path(project_root) / "data" / region / f"pred_{case_name}_{sensor_mode}"
-
-wf.run(pairs_manifest, ckpt_path, out_dir, retrain=False, prob_thresh=0.5)
-
-
+├── data_prep/    # Fetch (STAC / Planetary Computer), tile to COGs, manifests, pairing
+├── backbone/     # Shared sensor-agnostic CNN encoder
+├── fusion/       # Multi-sensor (S1+S2) fusion kernel, sits between backbone and heads
+├── adapters/     # Task-specific segmentation heads (deforestation, flood, land cover)
+├── analytics/    # Rule-based / statistical post-processing per task
+orchestrator/     # Workflow classes gluing the above end-to-end + the FastAPI service
 ```
 
-### Output
+A single call — `earth.query(task=..., lat=..., lon=..., start=..., end=...)` — is the
+intended shape of the unified interface; today, task/sensor combinations are driven
+through per-generation `Workflow` classes in `orchestrator/` rather than one entry point
 
-After running the workflow, you will find:
-```
-data/
-  └── location_deforestation_s1s2/
-        ├── S1/scene_1/tiles_s1/
-        ├── S2/scene_2/tiles_s2/
-        ├── collection_manifest.json
-        ├── pairs_manifest.json
-        └── pred_deforestation_s1s2/
-              ├── *.tif         # georeferenced mask tiles
-              └── quicklooks/
-                    ├── *_overlay.png
-                    ├── *_mask.png
+Land cover is the task currently wired end-to-end to the frontend: STAC ingestion,
+S1+S2 fusion, inference against a trained checkpoint, and training-from-scratch, all
+served over HTTP by `orchestrator/api_server_canvas.py`.
 
+```bash
+pip install -r requirements.txt
+uvicorn orchestrator.api_server_canvas:app --reload   # canvas-facing API, http://127.0.0.1:8000
+python -m pytest tests/                                # backend test suite
 ```
 
 ---
-## Future Work
 
-### Implemented
-- Multi-scene Sentinnel-1 and Sentinel-2 ingestion via STAC
-- Automated tiling manifesting, matching S1 and S2 scenes temporally, and pairing for change detection
-- Deforestation adapter (ResNet + U-Net)
-- Land cover classification adapter (ResNet + U-Net)
-- FastAPI endpoint with logging and visualization
+## Frontend: the canvas
 
-### Next Steps
-- Integrate additional sensors (e.g., Landsat, MODIS)
-- Introduce self-supervised pretraining for the shared backbone 
-- Add explainability layers
-- Extend earth.query() to handle multi-task inference
+A drag-and-drop node canvas (React + TypeScript + `@xyflow/react`) that mirrors the
+backend's pipeline as four top-level blocks:
+
+```
+Data → [Sentinel-1 / Sentinel-2] → Model → Analytics → Output
+                                       ↑         ↑
+                              Internal Data   "Vendor B"
+                              (CSV upload)   (mocked feed)
+```
+
+![Canvas UI showing the Data, Sentinel-1/2, Model, Internal Data, Vendor B, Analytics, and Output blocks wired together](canvas/docs/canvas-screenshot.png)
+
+- **Data** — AOI + date-range input, with deletable Sentinel-1/Sentinel-2 sensor
+  blocks; removing a sensor changes which trained checkpoint gets called (a genuinely
+  different, single-sensor model — not a toggle on one running model).
+- **Model** — runs inference or training against the backend's land-cover
+  endpoints, showing sensor-mode, pre-fusion feature width, and (in training mode)
+  real loss/mIoU results.
+- **Analytics / Output** — calibration thresholds and a results view (quicklooks,
+  per-modality confidence, an illustrative comparison against ESA WorldCover labels).
+- **Internal Data** / **Vendor B** — the reconciliation angle that makes this a
+  "combine with what the customer already has" demo rather than a thin wrapper around
+  the backend; Vendor B is openly simulated, not a real integration.
+
+```bash
+export NVM_DIR="$HOME/.nvm"; source "$NVM_DIR/nvm.sh"; nvm use v24.19.0
+cd canvas && npm install && npm run dev
+```
+
+The canvas talks to the backend over plain HTTP (`GET /canvas/landcover/sensor_modes`,
+`POST /canvas/landcover/infer_region`, `POST /canvas/landcover/train`) — no shared
+process or imports between the two halves.
 
 ---
+
 ## Vision
-To democratize access to Earth observation intelligence by providing a unified, extensible, and developer-friendly platform that turns satellite data into real-time environmental insights.
+
+To democratize access to Earth observation intelligence, by making it easier to
+explore, combine, and reason about — through a pipeline that turns raw satellite
+imagery into insight, and a canvas that makes that pipeline tangible to interact with.
